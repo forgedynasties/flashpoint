@@ -7,7 +7,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QProgressBar, QScrollArea, QFileDialog, QMessageBox)
 from PyQt6.QtCore import QTimer, QProcess, Qt
 
+# --- CONFIGURATION ---
 QDL_BIN = os.path.expanduser("~/aio/qdl/qdl")
+# ---------------------
 
 class DeviceFlashWidget(QWidget):
     def __init__(self, serial, remove_callback):
@@ -15,7 +17,7 @@ class DeviceFlashWidget(QWidget):
         self.serial = serial
         self.remove_callback = remove_callback
         self.is_flashing = False
-        self.is_finished = False # New state to prevent accidental re-flashing
+        self.is_finished = False
         
         self.layout = QHBoxLayout(self)
         
@@ -31,13 +33,11 @@ class DeviceFlashWidget(QWidget):
         self.log_preview = QLabel("Waiting...")
         self.log_preview.setStyleSheet("color: #666; font-family: monospace; font-size: 10px;")
         
-        # Individual Actions
         self.btn_flash = QPushButton("Flash")
         self.btn_flash.setFixedWidth(60)
         
         self.btn_remove = QPushButton("✕")
         self.btn_remove.setFixedWidth(30)
-        self.btn_remove.setToolTip("Remove from list")
         self.btn_remove.setStyleSheet("color: red; font-weight: bold;")
 
         self.layout.addWidget(self.label)
@@ -54,12 +54,27 @@ class DeviceFlashWidget(QWidget):
         
         self.btn_remove.clicked.connect(lambda: self.remove_callback(self.serial))
 
+    def set_booted_status(self):
+        if not self.is_flashing:
+            self.status.setText("BOOTED")
+            self.status.setStyleSheet("color: #7B1FA2;") # Purple
+            self.setStyleSheet("background-color: #F3E5F5;") # Light Purple
+            self.log_preview.setText("Device detected in OS mode.")
+            self.btn_flash.setEnabled(False)
+
+    def reset_to_ready(self):
+        if not self.is_flashing:
+            self.status.setText("Ready")
+            self.status.setStyleSheet("color: #1976D2;")
+            self.setStyleSheet("")
+            self.log_preview.setText("Device returned to EDL mode.")
+            self.btn_flash.setEnabled(True)
+
     def set_firmware_params(self, prog, raw, patch):
         self.prog, self.raw, self.patch = prog, raw, patch
 
     def start_flash(self):
-        if self.is_flashing or self.is_finished:
-            return
+        if self.is_flashing: return
             
         firmware_dir = os.path.dirname(self.raw)
         args = ["sudo", QDL_BIN, "-S", self.serial, "-s", "emmc", 
@@ -67,11 +82,12 @@ class DeviceFlashWidget(QWidget):
                 os.path.basename(self.patch), "-u", "1048576"]
         
         self.is_flashing = True
+        self.is_finished = False
         self.btn_flash.setEnabled(False)
         self.btn_remove.setEnabled(False)
         self.status.setText("FLASHING")
-        self.status.setStyleSheet("color: #E65100;") # Orange
-        self.setStyleSheet("background-color: #FFF3E0;") # Light Orange tint
+        self.status.setStyleSheet("color: #E65100;")
+        self.setStyleSheet("background-color: #FFF3E0;")
         
         self.process.setWorkingDirectory(firmware_dir)
         self.process.start(args[0], args[1:])
@@ -81,7 +97,6 @@ class DeviceFlashWidget(QWidget):
         for line in data.splitlines():
             clean = line.strip()
             if not clean: continue
-            print(f"[{self.serial}] {clean}")
             self.log_preview.setText(clean[-60:])
             match = re.search(r"(\d+\.\d+)%", clean)
             if match:
@@ -93,36 +108,23 @@ class DeviceFlashWidget(QWidget):
         if self.process.exitCode() == 0:
             self.is_finished = True
             self.status.setText("SUCCESS")
-            self.status.setStyleSheet("color: #2E7D32;") # Green
-            self.setStyleSheet("background-color: #E8F5E9;") # Light Green
+            self.status.setStyleSheet("color: #2E7D32;")
+            self.setStyleSheet("background-color: #E8F5E9;")
             self.progress.setValue(100)
             self.btn_flash.setText("Reset")
             self.btn_flash.setEnabled(True)
-            self.btn_flash.clicked.disconnect()
-            self.btn_flash.clicked.connect(self.reset_device)
         else:
             self.status.setText("FAILED")
-            self.status.setStyleSheet("color: #C62828;") # Red
-            self.setStyleSheet("background-color: #FFEBEE;") # Light Red
+            self.status.setStyleSheet("color: #C62828;")
+            self.setStyleSheet("background-color: #FFEBEE;")
             self.btn_flash.setEnabled(True)
             self.btn_flash.setText("Retry")
-
-    def reset_device(self):
-        """Allows re-flashing if explicitly clicked"""
-        self.is_finished = False
-        self.status.setText("Ready")
-        self.status.setStyleSheet("color: #1976D2;")
-        self.setStyleSheet("")
-        self.progress.setValue(0)
-        self.btn_flash.setText("Flash")
-        self.btn_flash.clicked.disconnect()
-        self.btn_flash.clicked.connect(self.start_flash)
 
 class FlashStation(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Qualcomm Pro Flash Station")
-        self.setMinimumSize(1000, 600)
+        self.setWindowTitle("Qualcomm Pro Flash Station (ADB Link)")
+        self.setMinimumSize(1100, 600)
         self.devices = {}
 
         self.central_widget = QWidget()
@@ -130,15 +132,6 @@ class FlashStation(QMainWindow):
         self.main_layout = QVBoxLayout(self.central_widget)
 
         self.setup_header()
-
-        # Labels for the list
-        list_header = QHBoxLayout()
-        list_header.addWidget(QLabel("<b>Device Serial</b>"), 0)
-        list_header.addWidget(QLabel("<b>Progress</b>"), 1)
-        list_header.addWidget(QLabel("<b>Status</b>"), 0)
-        list_header.addWidget(QLabel("<b>Logs</b>"), 1)
-        list_header.setContentsMargins(10, 0, 110, 0)
-        self.main_layout.addLayout(list_header)
 
         self.scroll = QScrollArea()
         self.container = QWidget()
@@ -150,7 +143,7 @@ class FlashStation(QMainWindow):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.scan)
-        self.timer.start(800) # Slightly slower scan to save CPU
+        self.timer.start(1000)
 
     def setup_header(self):
         group = QWidget()
@@ -159,19 +152,21 @@ class FlashStation(QMainWindow):
         btn_browse = QPushButton("Browse Folder")
         btn_browse.clicked.connect(self.pick_folder)
         
+        self.btn_reboot_edl = QPushButton("REBOOT ALL TO EDL")
+        self.btn_reboot_edl.setFixedHeight(40)
+        self.btn_reboot_edl.setStyleSheet("background-color: #4527A0; color: white; font-weight: bold;")
+        self.btn_reboot_edl.clicked.connect(self.reboot_all_to_edl)
+
         self.btn_start_all = QPushButton("FLASH ALL READY")
         self.btn_start_all.setFixedHeight(40)
         self.btn_start_all.setStyleSheet("background-color: #1B5E20; color: white; font-weight: bold;")
         self.btn_start_all.clicked.connect(self.flash_all_ready)
 
-        self.btn_clear_done = QPushButton("Clear Finished")
-        self.btn_clear_done.clicked.connect(self.clear_finished)
-
         layout.addWidget(QLabel("Firmware:"))
         layout.addWidget(self.fw_path)
         layout.addWidget(btn_browse)
-        layout.addSpacing(20)
-        layout.addWidget(self.btn_clear_done)
+        layout.addSpacing(10)
+        layout.addWidget(self.btn_reboot_edl)
         layout.addWidget(self.btn_start_all)
         self.main_layout.addWidget(group)
 
@@ -179,19 +174,64 @@ class FlashStation(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select Firmware Folder")
         if path: self.fw_path.setText(path)
 
-    def scan(self):
+    def reboot_all_to_edl(self):
+        """Finds all booted devices via ADB and triggers reboot edl using transport_id"""
         try:
-            res = subprocess.check_output(["sudo", QDL_BIN, "list"], stderr=subprocess.STDOUT).decode()
-            serials = re.findall(r'05c6:9008\s+([0-9a-fA-F]+)', res)
+            res = subprocess.check_output(["adb", "devices", "-l"]).decode()
+            # Find transport_id for every line that is a 'device'
+            transports = re.findall(r'transport_id:(\d+)', res)
             
-            for s in serials:
+            if not transports:
+                print("[ADB] No booted devices found.")
+                return
+
+            for tid in transports:
+                print(f"[ADB] Rebooting transport {tid} to EDL...")
+                subprocess.Popen(["adb", "-t", tid, "reboot", "edl"])
+        except Exception as e:
+            print(f"[ADB] Error: {e}")
+
+    def scan(self):
+        currently_connected = set()
+
+        # 1. Scan for EDL Devices
+        try:
+            edl_res = subprocess.check_output(["sudo", QDL_BIN, "list"], stderr=subprocess.STDOUT).decode()
+            edl_serials = re.findall(r'05c6:9008\s+([0-9a-fA-F]+)', edl_res)
+            for s in edl_serials:
+                currently_connected.add(s)
                 if s not in self.devices:
-                    w = DeviceFlashWidget(s, self.remove_device)
-                    self.devices[s] = w
-                    self.device_layout.insertWidget(self.device_layout.count()-1, w)
-                    # Connect individual flash button
-                    w.btn_flash.clicked.connect(w.start_flash)
+                    self.add_device_row(s)
+                else:
+                    if self.devices[s].status.text() == "BOOTED":
+                        self.devices[s].reset_to_ready()
         except: pass
+
+        # 2. Scan for Booted Devices (Normal Mode via lsusb)
+        try:
+            lsusb_res = subprocess.check_output(["lsusb"], stderr=subprocess.STDOUT).decode()
+            booted_serials = re.findall(r'05c6:901f.*?SN:([0-9a-fA-F]+)', lsusb_res)
+            for s in booted_serials:
+                currently_connected.add(s)
+                if s in self.devices:
+                    self.devices[s].set_booted_status()
+                else:
+                    self.add_device_row(s)
+                    self.devices[s].set_booted_status()
+        except: pass
+
+        # 3. Live Sync
+        all_known = list(self.devices.keys())
+        for s in all_known:
+            if s not in currently_connected:
+                if not self.devices[s].is_flashing:
+                    self.remove_device(s)
+
+    def add_device_row(self, serial):
+        w = DeviceFlashWidget(serial, self.remove_device)
+        self.devices[serial] = w
+        self.device_layout.insertWidget(self.device_layout.count()-1, w)
+        w.btn_flash.clicked.connect(w.start_flash)
 
     def remove_device(self, serial):
         if serial in self.devices:
@@ -199,29 +239,21 @@ class FlashStation(QMainWindow):
             widget.setParent(None)
             widget.deleteLater()
 
-    def clear_finished(self):
-        to_remove = [s for s, w in self.devices.items() if w.is_finished and not w.is_flashing]
-        for s in to_remove:
-            self.remove_device(s)
-
     def flash_all_ready(self):
         path = self.fw_path.text()
         if not os.path.isdir(path): return
-
+        
         files = os.listdir(path)
         prog = next((f for f in files if "firehose" in f and f.endswith(".elf")), 
                     next((f for f in files if f.endswith(".elf")), None))
         raw = next((f for f in files if "rawprogram" in f and f.endswith(".xml")), None)
         patch = next((f for f in files if "patch" in f and f.endswith(".xml")), None)
 
-        if not all([prog, raw, patch]):
-            QMessageBox.warning(self, "Files Missing", "Check folder for .elf and .xml files.")
-            return
+        if not all([prog, raw, patch]): return
 
         prog_p, raw_p, patch_p = [os.path.join(path, f) for f in [prog, raw, patch]]
-
         for w in self.devices.values():
-            if not w.is_flashing and not w.is_finished:
+            if not w.is_flashing and w.status.text() == "Ready":
                 w.set_firmware_params(prog_p, raw_p, patch_p)
                 w.start_flash()
 
