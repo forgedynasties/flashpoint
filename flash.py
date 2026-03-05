@@ -23,26 +23,32 @@ class DeviceFlashWidget(QWidget):
         self.layout.setContentsMargins(5, 5, 5, 5)
         self.layout.setSpacing(10)
         
+        # Serial
         self.label = QLabel(f"<b>{serial}</b>")
         self.label.setFixedWidth(150)
         
+        # Status
         self.status = QLabel("Ready")
         self.status.setFixedWidth(120)
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status.setStyleSheet("font-weight: bold; color: #1976D2; border: 1px solid #1976D2; border-radius: 4px;")
         
+        # ADB Tag
         self.adb_tag = QLabel("ADB OK")
-        self.adb_tag.setFixedWidth(60)
+        self.adb_tag.setFixedWidth(65)
         self.adb_tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.adb_tag.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; border-radius: 3px; font-size: 10px;")
         self.adb_tag.hide()
 
+        # Progress
         self.progress = QProgressBar()
         self.progress.setFixedWidth(150)
         
+        # Log Preview
         self.log_preview = QLabel("Waiting...")
         self.log_preview.setStyleSheet("color: #666; font-family: monospace; font-size: 10px;")
         
+        # Action Buttons
         self.btn_edl = QPushButton("EDL")
         self.btn_edl.setFixedWidth(60)
         self.btn_edl.setStyleSheet("background-color: #EDE7F6; color: #4527A0; font-weight: bold;")
@@ -76,13 +82,12 @@ class DeviceFlashWidget(QWidget):
         self.btn_edl.setText("...")
         self.btn_edl.setEnabled(False)
         self.reboot_callback(self.serial)
-        QTimer.singleShot(2000, lambda: self.btn_edl.setText("EDL"))
+        QTimer.singleShot(2500, lambda: self.btn_edl.setText("EDL"))
 
     def set_boot_mode(self, mode_type, has_adb=False):
         if not self.is_flashing:
             self.status.setText(mode_type)
-            is_user = "USER" in mode_type
-            color = "#00796B" if is_user else "#7B1FA2"
+            color = "#00796B" if "USER" in mode_type else "#7B1FA2"
             self.status.setStyleSheet(f"font-weight: bold; color: {color}; border: 1px solid {color}; border-radius: 4px;")
             self.btn_flash.setEnabled(False)
             self.btn_edl.show()
@@ -228,46 +233,43 @@ class FlashStation(QMainWindow):
                 self.devices[s].reset_to_ready()
         except: pass
 
-        # 3. Booted Devices (MTP / DEBUG)
+        # 3. Booted Devices (MTP: 4ee1 or MTP+ADB: 4e11)
         try:
             lsusb_res = subprocess.check_output(["lsusb"]).decode()
             for line in lsusb_res.splitlines():
-                # Checking for your specific VID:PID
-                if "18d1:4ee1" in line or "05c6:901f" in line:
-                    bus = re.search(r'Bus (\d+)', line).group(1).lstrip('0')
-                    # Bus-2 is the mapping used for adb usb:x-x
-                    path = f"{bus}-2" 
+                if any(x in line for x in ["18d1:4ee1", "18d1:4e11", "05c6:901f"]):
+                    bus_match = re.search(r'Bus (\d+) Device (\d+)', line)
+                    if not bus_match: continue
+                    
+                    s_bus, s_dev = bus_match.groups()
+                    path = f"{s_bus.lstrip('0')}-2" 
                     
                     hw_sn = None
-                    # Run lsusb -v for this specific device to get the iProduct string
-                    # Extraction: Bus 003 Device 029 -> -s 003:029
-                    dev_addr = re.search(r'Bus (\d+) Device (\d+)', line)
-                    if dev_addr:
-                        s_bus, s_dev = dev_addr.groups()
-                        try:
-                            # Search specifically for the SN pattern in the verbose output
-                            v_out = subprocess.check_output(["lsusb", "-v", "-s", f"{s_bus}:{s_dev}"], stderr=subprocess.DEVNULL).decode()
-                            sn_match = re.search(r'SN:([0-9a-fA-F]+)', v_out)
-                            if sn_match:
-                                hw_sn = sn_match.group(1)
-                        except: pass
+                    try:
+                        # Scan verbose to find the SN: part in iProduct
+                        v_out = subprocess.check_output(["lsusb", "-v", "-s", f"{s_bus}:{s_dev}"], stderr=subprocess.DEVNULL).decode()
+                        # This matches your string: TRINKET-IOT-IDP_CID:0411_SN:F8AB9155
+                        sn_match = re.search(r'_SN:([0-9a-fA-F]+)', v_out)
+                        if sn_match:
+                            hw_sn = sn_match.group(1)
+                    except: pass
 
-                    # Fallback to the end of the line if lsusb -v fails
-                    if not hw_sn:
-                        hw_sn = line.split()[-1]
-
-                    if hw_sn and hw_sn != "(MTP)":
+                    if hw_sn:
                         currently_connected.add(hw_sn)
                         if hw_sn not in self.devices: self.add_device_row(hw_sn)
                         
-                        has_adb = path in usb_to_tid
-                        mode = "USER BOOTED" if "18d1:4ee1" in line else "DEBUG BOOTED"
+                        # ADB is active if PID is 4e11 (User) or 901f (Debug)
+                        # OR if it's found in the adb devices -l transport list
+                        has_adb = "18d1:4e11" in line or "05c6:901f" in line or path in usb_to_tid
+                        
+                        mode = "USER BOOTED" if ("4ee1" in line or "4e11" in line) else "DEBUG BOOTED"
                         self.devices[hw_sn].set_boot_mode(mode, has_adb)
                         
-                        if has_adb: self.adb_transports[hw_sn] = usb_to_tid[path]
+                        if has_adb and path in usb_to_tid:
+                            self.adb_transports[hw_sn] = usb_to_tid[path]
         except: pass
 
-        # 4. Clean up disconnected devices
+        # 4. Clean up disconnected
         for s in list(self.devices.keys()):
             if s not in currently_connected and not self.devices[s].is_flashing:
                 self.remove_device(s)
@@ -284,8 +286,9 @@ class FlashStation(QMainWindow):
             subprocess.Popen(["adb", "-t", tid, "reboot", "edl"])
 
     def reboot_all_to_edl(self):
-        for serial in self.adb_transports:
-            self.reboot_to_edl(serial)
+        for serial, tid in self.adb_transports.items():
+            if serial in self.devices and self.devices[serial].btn_edl.isVisible():
+                self.devices[serial].trigger_edl_reboot()
 
     def handle_manual_flash(self, widget):
         path = self.fw_combo.currentText()
