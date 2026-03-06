@@ -3,7 +3,8 @@ import os
 import re
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
-    QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QProgressBar
+    QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QProgressBar,
+    QPlainTextEdit
 )
 from PyQt6.QtCore import QTimer, Qt, QProcess
 
@@ -93,17 +94,20 @@ class FlashStation(QMainWindow):
     def setup_device_table(self):
         """Set up the device table."""
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(["Serial", "Status", "ADB", "Build ID", "Progress", "Actions", "Remove"])
-        
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels(["Serial", "Status", "ADB", "Build ID", "Progress", "Logs", "Actions", "Remove"])
+
         # Set table to stretch and fill available space
         self.table.horizontalHeader().setStretchLastSection(False)
-        
-        # Set columns to stretch proportionally
-        for col in range(7):
-            self.table.horizontalHeader().setSectionResizeMode(
-                col, self.table.horizontalHeader().ResizeMode.Stretch
-            )
+
+        header = self.table.horizontalHeader()
+        resize = header.ResizeMode
+        # Fixed-width columns
+        for col, width in [(0, 120), (1, 70), (2, 40), (3, 120), (4, 100), (6, 110), (7, 50)]:
+            header.setSectionResizeMode(col, resize.Fixed)
+            self.table.setColumnWidth(col, width)
+        # Logs column stretches to fill remaining space
+        header.setSectionResizeMode(5, resize.Stretch)
         
         self.table.verticalHeader().setDefaultSectionSize(50)
         self.table.setAlternatingRowColors(True)
@@ -217,34 +221,44 @@ class FlashStation(QMainWindow):
         progress.setValue(0)
         progress.setStyleSheet(Styles.get_progress_bar_style())
         self.table.setCellWidget(row, 4, progress)
-        
+
+        # Logs column
+        log_box = QPlainTextEdit()
+        log_box.setReadOnly(True)
+        log_box.setMaximumBlockCount(500)
+        log_box.setStyleSheet(
+            f"background: {Colors.WHITE}; color: {Colors.LIGHT_TEXT};"
+            "font-family: monospace; font-size: 10px; border: none; padding: 2px;"
+        )
+        self.table.setCellWidget(row, 5, log_box)
+
         # Action buttons column (Flash + EDL)
         action_widget = QWidget()
         action_layout = QHBoxLayout(action_widget)
         action_layout.setContentsMargins(2, 2, 2, 2)
         action_layout.setSpacing(4)
-        
+
         btn_flash = QPushButton("Flash")
         btn_flash.setMaximumWidth(60)
         btn_flash.setStyleSheet(Styles.get_action_button_style(Colors.PRIMARY))
         btn_flash.clicked.connect(lambda: self.handle_manual_flash(serial))
-        
+
         btn_edl = QPushButton("EDL")
         btn_edl.setMaximumWidth(50)
         btn_edl.setStyleSheet(Styles.get_action_button_style(Colors.EDL_MODE))
         btn_edl.clicked.connect(lambda: self.handle_edl_reboot(serial))
         btn_edl.hide()
-        
+
         action_layout.addWidget(btn_flash)
         action_layout.addWidget(btn_edl)
-        self.table.setCellWidget(row, 5, action_widget)
-        
+        self.table.setCellWidget(row, 6, action_widget)
+
         # Remove button column
         btn_remove = QPushButton("X")
         btn_remove.setMaximumWidth(50)
         btn_remove.setStyleSheet(Styles.get_remove_button_style())
         btn_remove.clicked.connect(lambda: self.remove_device(serial))
-        self.table.setCellWidget(row, 6, btn_remove)
+        self.table.setCellWidget(row, 7, btn_remove)
         
         # Store device info in a dict
         self.devices[serial] = {
@@ -253,6 +267,7 @@ class FlashStation(QMainWindow):
             "adb_item": adb_item,
             "build_id_item": build_id_item,
             "progress": progress,
+            "log_box": log_box,
             "btn_flash": btn_flash,
             "btn_edl": btn_edl,
             "is_flashing": False,
@@ -382,6 +397,7 @@ class FlashStation(QMainWindow):
         device_info["btn_edl"].setEnabled(False)
         device_info["status_item"].setText("flashing")
         device_info["progress"].setValue(0)
+        device_info["log_box"].clear()
         
         # Build and start flash process
         process = QProcess()
@@ -398,6 +414,7 @@ class FlashStation(QMainWindow):
             for line in data.splitlines():
                 stripped = line.strip()
                 if stripped:
+                    device_info["log_box"].appendPlainText(stripped)
                     match = re.search(r"(\d+\.\d+)%", line)
                     if match:
                         progress_val = int(float(match.group(1)))
