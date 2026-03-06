@@ -20,9 +20,9 @@ class FlashStation(QMainWindow):
     def __init__(self):
         """Initialize the flash station."""
         super().__init__()
-        self.setWindowTitle("Qualcomm Pro Flash Station")
-        self.setMinimumSize(1200, 650)
-        self.setGeometry(100, 100, 1200, 650)
+        self.setWindowTitle("Qualcomm Flash Station")
+        self.setMinimumSize(1300, 700)
+        self.setGeometry(100, 100, 1300, 750)
         
         self.devices = {}
         self.adb_transports = {}
@@ -48,47 +48,45 @@ class FlashStation(QMainWindow):
         header = QWidget()
         header.setStyleSheet(Styles.get_header_group_style())
         layout = QHBoxLayout(header)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
         
-        # Firmware selector
-        fw_label = QLabel("Firmware:")
+        # Firmware section
+        fw_label = QLabel("Firmware")
         fw_font = fw_label.font()
+        fw_font.setPointSize(11)
         fw_font.setBold(True)
         fw_label.setFont(fw_font)
+        fw_label.setStyleSheet(f"color: {Colors.DARK_TEXT};")
         
         self.fw_combo = QComboBox()
-        self.fw_combo.setMinimumWidth(450)
-        self.fw_combo.setStyleSheet("""
-            QComboBox {
-                padding: 6px;
-                border: 1px solid #E0E0E0;
-                border-radius: 4px;
-                background-color: white;
-            }
-        """)
+        self.fw_combo.setMinimumWidth(380)
+        self.fw_combo.setMaximumWidth(500)
+        self.fw_combo.setStyleSheet(Styles.get_combobox_style())
         self.load_env_firmwares()
         
         # Browse button
-        btn_browse = QPushButton("📁 Browse Folder")
+        btn_browse = QPushButton("Browse")
+        btn_browse.setFixedSize(80, 36)
         btn_browse.setStyleSheet(Styles.get_action_button_style())
         btn_browse.clicked.connect(self.pick_folder)
         
         layout.addWidget(fw_label)
         layout.addWidget(self.fw_combo)
         layout.addWidget(btn_browse)
+        
+        # Spacer
         layout.addStretch()
         
-        # Reboot to EDL button
-        self.btn_reboot_all_edl = QPushButton("🔌 REBOOT ALL TO EDL")
-        self.btn_reboot_all_edl.setStyleSheet(Styles.get_action_button_style(Colors.TAG_PURPLE))
-        self.btn_reboot_all_edl.setMinimumWidth(180)
+        # Action buttons on the right
+        self.btn_reboot_all_edl = QPushButton("Reboot All to EDL")
+        self.btn_reboot_all_edl.setFixedSize(160, 36)
+        self.btn_reboot_all_edl.setStyleSheet(Styles.get_action_button_style(Colors.EDL_MODE))
         self.btn_reboot_all_edl.clicked.connect(self.reboot_all_to_edl)
         
-        # Flash all ready button
-        self.btn_start_all = QPushButton("⚡ FLASH ALL READY")
+        self.btn_start_all = QPushButton("Flash All Ready")
+        self.btn_start_all.setFixedSize(140, 36)
         self.btn_start_all.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
-        self.btn_start_all.setMinimumWidth(160)
         self.btn_start_all.clicked.connect(self.flash_all_ready)
         
         layout.addWidget(self.btn_reboot_all_edl)
@@ -103,10 +101,10 @@ class FlashStation(QMainWindow):
         self.scroll.setWidgetResizable(True)
         
         self.container = QWidget()
-        self.container.setStyleSheet("background-color: #F5F5F5;")
+        self.container.setStyleSheet(f"background-color: {Colors.BG_LIGHT};")
         self.device_layout = QVBoxLayout(self.container)
-        self.device_layout.setContentsMargins(8, 8, 8, 8)
-        self.device_layout.setSpacing(6)
+        self.device_layout.setContentsMargins(12, 12, 12, 12)
+        self.device_layout.setSpacing(8)
         self.device_layout.addStretch()
         
         self.scroll.setWidget(self.container)

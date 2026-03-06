@@ -16,7 +16,7 @@ class FlashManager:
         """
         try:
             files = os.listdir(path)
-            prog = next(f for f in files if f.endswith(".elf"))
+            prog = next(f for f in files if "prog" in f and f.endswith(".elf"))
             raw = next(f for f in files if "rawprogram" in f and f.endswith(".xml"))
             patch = next(f for f in files if "patch" in f and f.endswith(".xml"))
             return (

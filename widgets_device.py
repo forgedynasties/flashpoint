@@ -1,9 +1,9 @@
 """Device widget component for displaying and managing individual devices."""
 import re
 from PyQt6.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QProgressBar, QPushButton
+    QWidget, QHBoxLayout, QVBoxLayout, QLabel, QProgressBar, QPushButton
 )
-from PyQt6.QtCore import QTimer, QProcess, Qt
+from PyQt6.QtCore import QTimer, QProcess, Qt, QSize
 from PyQt6.QtGui import QFont
 
 from styles import Styles, Colors
@@ -27,70 +27,87 @@ class DeviceFlashWidget(QWidget):
         self.reboot_callback = reboot_callback
         self.is_flashing = False
         
+        self.setStyleSheet(Styles.get_device_row_style())
         self.setup_ui()
         self.setup_process()
     
     def setup_ui(self):
         """Set up the user interface."""
-        self.layout = QHBoxLayout(self)
-        self.layout.setContentsMargins(8, 8, 8, 8)
-        self.layout.setSpacing(12)
+        self.setMinimumHeight(90)
+        
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(12)
         
         # Serial label
-        self.label = QLabel(f"<b>{self.serial}</b>")
-        self.label.setFixedWidth(150)
+        self.label = QLabel(self.serial)
+        self.label.setFixedWidth(120)
         font = self.label.font()
         font.setPointSize(10)
+        font.setBold(True)
         self.label.setFont(font)
+        self.label.setStyleSheet("color: #1F2937;")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
         
         # Status label
         self.status = QLabel("Ready")
-        self.status.setFixedWidth(120)
+        self.status.setFixedWidth(100)
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status.setStyleSheet(Styles.get_ready_status_style())
         
         # ADB tag
         self.adb_tag = QLabel("ADB ✓")
-        self.adb_tag.setFixedWidth(70)
+        self.adb_tag.setFixedWidth(55)
         self.adb_tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.adb_tag.setStyleSheet(Styles.get_adb_tag_style())
         self.adb_tag.hide()
         
-        # Progress bar
+        # Progress bar and log preview in vertical layout
+        progress_log_layout = QVBoxLayout()
+        progress_log_layout.setContentsMargins(0, 4, 0, 4)
+        progress_log_layout.setSpacing(6)
+        
         self.progress = QProgressBar()
-        self.progress.setFixedWidth(150)
+        self.progress.setFixedHeight(12)
         self.progress.setValue(0)
         self.progress.setStyleSheet(Styles.get_progress_bar_style())
         
-        # Log preview
         self.log_preview = QLabel("Waiting...")
         self.log_preview.setStyleSheet(Styles.get_log_preview_style())
-        self.log_preview.setMinimumHeight(24)
+        self.log_preview.setMinimumHeight(28)
+        self.log_preview.setWordWrap(False)
         
-        # Action buttons
+        progress_log_layout.addWidget(self.progress)
+        progress_log_layout.addWidget(self.log_preview)
+        
+        # Action buttons layout
+        buttons_layout = QHBoxLayout()
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.setSpacing(6)
+        
         self.btn_edl = QPushButton("EDL")
-        self.btn_edl.setFixedWidth(60)
+        self.btn_edl.setFixedSize(50, 32)
         self.btn_edl.setStyleSheet(Styles.get_edl_button_style())
         self.btn_edl.hide()
         
         self.btn_flash = QPushButton("Flash")
-        self.btn_flash.setFixedWidth(70)
+        self.btn_flash.setFixedSize(60, 32)
         self.btn_flash.setStyleSheet(Styles.get_action_button_style(Colors.PRIMARY))
         
         self.btn_remove = QPushButton("✕")
-        self.btn_remove.setFixedWidth(35)
-        self.btn_remove.setFixedHeight(35)
+        self.btn_remove.setFixedSize(32, 32)
         self.btn_remove.setStyleSheet(Styles.get_remove_button_style())
         
-        # Add widgets to layout
-        self.layout.addWidget(self.label)
-        self.layout.addWidget(self.status)
-        self.layout.addWidget(self.adb_tag)
-        self.layout.addWidget(self.progress)
-        self.layout.addWidget(self.log_preview, 1)
-        self.layout.addWidget(self.btn_edl)
-        self.layout.addWidget(self.btn_flash)
-        self.layout.addWidget(self.btn_remove)
+        buttons_layout.addWidget(self.btn_edl)
+        buttons_layout.addWidget(self.btn_flash)
+        buttons_layout.addWidget(self.btn_remove)
+        
+        # Add all widgets to main layout
+        main_layout.addWidget(self.label)
+        main_layout.addWidget(self.status)
+        main_layout.addWidget(self.adb_tag)
+        main_layout.addLayout(progress_log_layout, 1)
+        main_layout.addLayout(buttons_layout)
         
         # Connect signals
         self.btn_remove.clicked.connect(lambda: self.remove_callback(self.serial))
@@ -164,7 +181,7 @@ class DeviceFlashWidget(QWidget):
         self.btn_remove.setEnabled(False)
         self.progress.setValue(0)
         
-        self.status.setText("FLASHING")
+        self.status.setText("Flashing...")
         self.status.setStyleSheet(Styles.get_flashing_status_style())
         
         # Build and start flash process
@@ -181,12 +198,15 @@ class DeviceFlashWidget(QWidget):
         data = self.process.readAllStandardOutput().data().decode()
         for line in data.splitlines():
             stripped = line.strip()
-            self.log_preview.setText(stripped[-60:] if len(stripped) > 60 else stripped)
+            if stripped:
+                # Show last 55 characters to fit nicely
+                self.log_preview.setText(stripped[-55:])
             
             # Extract progress percentage
             match = re.search(r"(\d+\.\d+)%", line)
             if match:
-                self.progress.setValue(int(float(match.group(1))))
+                progress_val = int(float(match.group(1)))
+                self.progress.setValue(min(progress_val, 100))
     
     def handle_finished(self):
         """Handle completion of flash process."""
@@ -195,9 +215,9 @@ class DeviceFlashWidget(QWidget):
         self.btn_flash.setEnabled(True)
         
         if self.process.exitCode() == 0:
-            self.status.setText("SUCCESS ✓")
+            self.status.setText("Success ✓")
             self.status.setStyleSheet(Styles.get_success_status_style())
             self.progress.setValue(100)
         else:
-            self.status.setText("FAILED ✗")
+            self.status.setText("Failed ✗")
             self.status.setStyleSheet(Styles.get_failed_status_style())
