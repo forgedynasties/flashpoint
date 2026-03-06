@@ -1,6 +1,7 @@
 """Device scanning and detection utilities."""
 import subprocess
 import re
+import os
 from config import QDL_BIN, USB_PIDs
 
 
@@ -22,13 +23,34 @@ class DeviceScanner:
         return devices
     
     @staticmethod
+    def get_usb_path(bus, devnum):
+        """Resolve USB path (e.g. '3-1') from bus and device numbers via sysfs."""
+        bus_s = str(int(bus))
+        dev_s = str(int(devnum))
+        try:
+            for entry in os.listdir('/sys/bus/usb/devices'):
+                base = f'/sys/bus/usb/devices/{entry}'
+                try:
+                    with open(f'{base}/busnum') as f:
+                        if f.read().strip() != bus_s:
+                            continue
+                    with open(f'{base}/devnum') as f:
+                        if f.read().strip() == dev_s:
+                            return entry  # e.g. "3-1"
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
     def get_adb_transport_map():
         """Map USB paths to ADB transport IDs."""
         usb_to_tid = {}
         try:
             adb_out = subprocess.check_output(["adb", "devices", "-l"]).decode()
             for line in adb_out.splitlines():
-                m = re.search(r'usb:(\d+-\d+).*transport_id:(\d+)', line)
+                m = re.search(r'usb:(\S+).*transport_id:(\d+)', line)
                 if m:
                     usb_to_tid[m.group(1)] = m.group(2)
         except:
@@ -36,18 +58,18 @@ class DeviceScanner:
         return usb_to_tid
     
     @staticmethod
-    def get_build_id(usb_path):
-        """Get build ID from device via ADB using USB path.
-        
+    def get_build_id(transport_id):
+        """Get build ID from device via ADB using transport ID.
+
         Args:
-            usb_path: USB port location (e.g., "1-2")
-            
+            transport_id: ADB transport ID string
+
         Returns:
             Build ID string or empty string if not available
         """
         try:
             output = subprocess.check_output(
-                ["adb", "-s", f"usb:{usb_path}", "shell", "getprop", "ro.build.id"],
+                ["adb", "-t", transport_id, "shell", "getprop", "ro.build.id"],
                 stderr=subprocess.DEVNULL,
                 timeout=2
             ).decode().strip()
@@ -72,7 +94,7 @@ class DeviceScanner:
                     continue
                 
                 s_bus, s_dev = bus_match.groups()
-                path = f"{s_bus.lstrip('0')}-2"
+                path = DeviceScanner.get_usb_path(s_bus, s_dev)
                 
                 hw_sn = None
                 try:
@@ -86,20 +108,20 @@ class DeviceScanner:
                 except:
                     pass
                 
-                if hw_sn:
+                if hw_sn and path:
                     has_adb = (
-                        "18d1:4e11" in line or 
-                        "05c6:901f" in line or 
+                        "18d1:4e11" in line or
+                        "05c6:901f" in line or
                         path in usb_to_tid
                     )
                     mode = "USER BOOTED" if "4ee1" in line or "4e11" in line else "DEBUG BOOTED"
-                    
+
                     devices[hw_sn] = {
                         "mode": mode,
                         "has_adb": has_adb,
                         "path": path,
                     }
-                    
+
                     if has_adb and path in usb_to_tid:
                         devices[hw_sn]["adb_tid"] = usb_to_tid[path]
         except:
@@ -125,9 +147,9 @@ class DeviceScanner:
             currently_connected.add(serial)
             devices_info[serial] = info
             
-            # Get build_id if ADB is available, using USB path
-            if info.get("has_adb") and "path" in info:
-                build_id = DeviceScanner.get_build_id(info["path"])
+            # Get build_id if ADB is available, using transport ID
+            if info.get("has_adb") and "adb_tid" in info:
+                build_id = DeviceScanner.get_build_id(info["adb_tid"])
                 if build_id:
                     devices_info[serial]["build_id"] = build_id
         
