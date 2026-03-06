@@ -76,6 +76,7 @@ class FlashStation(QMainWindow):
         self.devices = {}
         self.adb_transports = {}
         self.device_processes = {}
+        self.edl_pending = set()
 
         self.setup_ui()
         self.setup_scanning()
@@ -231,6 +232,9 @@ class FlashStation(QMainWindow):
 
             if "edl" in mode:
                 status = "edl"
+                if serial in self.edl_pending:
+                    self.edl_pending.discard(serial)
+                    self._update_ui_lock()
             elif "debug" in mode:
                 status = "debug"
             elif "user" in mode:
@@ -396,6 +400,8 @@ class FlashStation(QMainWindow):
 
             self.adb_transports.pop(serial, None)
             self.device_processes.pop(serial, None)
+            self.edl_pending.discard(serial)
+            self._update_ui_lock()
             self._update_selection_label()
 
     # ------------------------------------------------------------------
@@ -487,16 +493,8 @@ class FlashStation(QMainWindow):
     def handle_edl_reboot(self, serial):
         if serial in self.adb_transports:
             RebootManager.reboot_to_edl(self.adb_transports[serial])
-            device_info = self.devices[serial]
-            device_info["btn_edl"].setText("...")
-            device_info["btn_edl"].setEnabled(False)
-            QTimer.singleShot(2000, lambda: self.restore_edl_button(serial))
-
-    def restore_edl_button(self, serial):
-        if serial in self.devices:
-            device_info = self.devices[serial]
-            device_info["btn_edl"].setText("EDL")
-            device_info["btn_edl"].setEnabled(True)
+            self.edl_pending.add(serial)
+            self._update_ui_lock()
 
     def reboot_all_to_edl(self):
         for serial in list(self.devices.keys()):
@@ -512,7 +510,7 @@ class FlashStation(QMainWindow):
         return any(p["is_flashing"] for p in self.device_processes.values())
 
     def _update_ui_lock(self):
-        self.central_widget.setEnabled(not self._any_flashing())
+        self.central_widget.setEnabled(not self._any_flashing() and not self.edl_pending)
 
     # ------------------------------------------------------------------
     # Flashing
