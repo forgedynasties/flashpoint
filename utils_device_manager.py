@@ -10,14 +10,32 @@ class DeviceScanner:
     
     @staticmethod
     def get_edl_devices():
-        """Scan for EDL (QDL mode) devices."""
-        devices = set()
+        """Scan for EDL (QDL mode) devices. Returns dict of serial -> usb_path (or None)."""
+        # Collect USB paths for all EDL PIDs found in lsusb
+        edl_paths = []
+        try:
+            lsusb_res = subprocess.check_output(["lsusb"]).decode()
+            for line in lsusb_res.splitlines():
+                if "05c6:9008" not in line:
+                    continue
+                bus_match = re.search(r'Bus (\d+) Device (\d+)', line)
+                if not bus_match:
+                    continue
+                s_bus, s_dev = bus_match.groups()
+                path = DeviceScanner.get_usb_path(s_bus, s_dev)
+                edl_paths.append(path)
+        except:
+            pass
+
+        devices = {}
         try:
             edl_res = subprocess.check_output(
                 ["sudo", QDL_BIN, "list"], stderr=subprocess.STDOUT
             ).decode()
-            for s in re.findall(r'05c6:9008\s+([0-9a-fA-F]+)', edl_res):
-                devices.add(s)
+            serials = re.findall(r'05c6:9008\s+([0-9a-fA-F]+)', edl_res)
+            for i, s in enumerate(serials):
+                path = edl_paths[i] if i < len(edl_paths) else None
+                devices[s] = path
         except:
             pass
         return devices
@@ -137,9 +155,9 @@ class DeviceScanner:
         
         # EDL Devices
         edl_devices = DeviceScanner.get_edl_devices()
-        for serial in edl_devices:
+        for serial, path in edl_devices.items():
             currently_connected.add(serial)
-            devices_info[serial] = {"mode": "EDL", "has_adb": False}
+            devices_info[serial] = {"mode": "EDL", "has_adb": False, "path": path}
         
         # Booted devices
         booted_devices = DeviceScanner.get_booted_devices()

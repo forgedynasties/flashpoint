@@ -4,7 +4,7 @@ import re
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
     QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QProgressBar,
-    QCheckBox, QHeaderView, QSizePolicy
+    QCheckBox, QHeaderView, QSizePolicy, QDialog, QSpacerItem
 )
 from PyQt6.QtCore import QTimer, Qt, QProcess, QRect
 from PyQt6.QtGui import QColor, QPen, QBrush
@@ -19,11 +19,12 @@ COL_CHECK    = 0
 COL_SERIAL   = 1
 COL_STATUS   = 2
 COL_ADB      = 3
-COL_BUILD    = 4
-COL_PROGRESS = 5
-COL_LOGS     = 6
-COL_ACTIONS  = 7
-COL_COUNT    = 8
+COL_USB      = 4
+COL_BUILD    = 5
+COL_PROGRESS = 6
+COL_LOGS     = 7
+COL_ACTIONS  = 8
+COL_COUNT    = 9
 
 
 class CheckboxHeader(QHeaderView):
@@ -150,7 +151,7 @@ class FlashStation(QMainWindow):
         self.table = QTableWidget()
         self.table.setColumnCount(COL_COUNT)
         self.table.setHorizontalHeaderLabels([
-            "", "Serial", "Status", "ADB", "Build ID",
+            "", "Serial", "Status", "ADB", "USB Port", "Build ID",
             "Progress", "Logs", "Actions",
         ])
 
@@ -162,7 +163,7 @@ class FlashStation(QMainWindow):
         resize = hdr.ResizeMode
         fixed_cols = {
             COL_CHECK: 42, COL_SERIAL: 130, COL_STATUS: 90, COL_ADB: 55,
-            COL_BUILD: 160, COL_LOGS: 220, COL_ACTIONS: 140,
+            COL_USB: 75, COL_BUILD: 160, COL_LOGS: 220, COL_ACTIONS: 140,
         }
         for col, width in fixed_cols.items():
             hdr.setSectionResizeMode(col, resize.Fixed)
@@ -229,6 +230,7 @@ class FlashStation(QMainWindow):
             mode = info["mode"].lower()
             has_adb = info.get("has_adb", False)
             build_id = info.get("build_id", "")
+            usb_path = info.get("path") or ""
 
             if "edl" in mode:
                 status = "edl"
@@ -242,7 +244,7 @@ class FlashStation(QMainWindow):
             else:
                 status = "ready"
 
-            self.update_device_status(device_info, status, has_adb, build_id)
+            self.update_device_status(device_info, status, has_adb, build_id, usb_path)
 
             if "adb_tid" in info:
                 self.adb_transports[serial] = info["adb_tid"]
@@ -289,6 +291,11 @@ class FlashStation(QMainWindow):
         adb_item = QTableWidgetItem("off")
         adb_item.setFlags(adb_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.table.setItem(row, COL_ADB, adb_item)
+
+        # USB Port
+        usb_item = QTableWidgetItem("")
+        usb_item.setFlags(usb_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.table.setItem(row, COL_USB, usb_item)
 
         # Build ID
         build_id_item = QTableWidgetItem("")
@@ -344,6 +351,7 @@ class FlashStation(QMainWindow):
             "chk": chk,
             "status_item": status_item,
             "adb_item": adb_item,
+            "usb_item": usb_item,
             "build_id_item": build_id_item,
             "progress": progress,
             "log_box": log_box,
@@ -359,7 +367,7 @@ class FlashStation(QMainWindow):
 
         self._update_selection_label()
 
-    def update_device_status(self, device_info, status, has_adb, build_id):
+    def update_device_status(self, device_info, status, has_adb, build_id, usb_path=""):
         old_status = device_info["status_item"].text()
         device_info["status_item"].setText(status)
         device_info["status_item"].setForeground(
@@ -370,6 +378,8 @@ class FlashStation(QMainWindow):
         device_info["adb_item"].setForeground(
             QColor(Colors.SUCCESS if has_adb else Colors.TEXT_DIM)
         )
+        device_info["usb_item"].setText(usb_path)
+        device_info["usb_item"].setForeground(QColor(Colors.TEXT_SECONDARY))
 
         # Silently uncheck devices that leave EDL mode
         if old_status == "edl" and status != "edl" and device_info["chk"].isChecked():
@@ -448,13 +458,46 @@ class FlashStation(QMainWindow):
             return
         self._update_selection_label()
 
+    def _make_dialog(self):
+        """Create a styled QMessageBox matching the dark theme."""
+        msg = QMessageBox(self)
+        msg.setStyleSheet(f"""
+            QMessageBox {{
+                background-color: {Colors.BG_ELEVATED};
+                color: {Colors.TEXT_PRIMARY};
+            }}
+            QMessageBox QLabel {{
+                color: {Colors.TEXT_PRIMARY};
+                font-size: 12px;
+                min-width: 280px;
+            }}
+            QPushButton {{
+                background-color: {Colors.BG_SURFACE};
+                color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {Colors.BORDER_LIGHT};
+                padding: 5px 16px;
+                min-width: 80px;
+                font-size: 11px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.PRIMARY};
+                color: {Colors.WHITE};
+                border-color: {Colors.PRIMARY};
+            }}
+            QPushButton:pressed {{
+                background-color: {Colors.PRIMARY}AA;
+            }}
+        """)
+        return msg
+
     def _show_edl_warning(self, serial):
         if serial not in self.devices:
             return
         device_info = self.devices[serial]
         has_adb = device_info["adb_item"].text() == "on"
 
-        msg = QMessageBox(self)
+        msg = self._make_dialog()
         msg.setWindowTitle("Device Not in EDL")
         msg.setText(
             f"Device <b>{serial}</b> is not in EDL mode.<br><br>"
@@ -473,7 +516,7 @@ class FlashStation(QMainWindow):
             msg.exec()
 
     def _show_edl_warning_multi(self, serials):
-        msg = QMessageBox(self)
+        msg = self._make_dialog()
         msg.setWindowTitle("Devices Not in EDL")
         msg.setText(
             f"{len(serials)} device(s) are not in EDL mode and were not selected."
