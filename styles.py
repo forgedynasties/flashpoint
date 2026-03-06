@@ -152,9 +152,16 @@ class Styles:
                 color: {Colors.TEXT_SECONDARY};
                 font-size: 10px;
             }}
+            QProgressBar:disabled {{
+                background-color: {Colors.BG_ELEVATED};
+                color: {Colors.TEXT_SECONDARY};
+            }}
             QProgressBar::chunk {{
                 background-color: {color};
                 border-radius: 3px;
+            }}
+            QProgressBar::chunk:disabled {{
+                background-color: {color};
             }}
         """
 
@@ -253,10 +260,10 @@ class Styles:
     @staticmethod
     def get_log_box_style():
         return (
-            f"color: {Colors.TEXT_SECONDARY};"
+            f"QLabel {{ color: {Colors.TEXT_SECONDARY}; background: transparent;"
             "font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;"
-            "font-size: 10px;"
-            "background: transparent;"
+            "font-size: 10px; }"
+            f"QLabel:disabled {{ color: {Colors.TEXT_SECONDARY}; background: transparent; }}"
         )
 
     # legacy compat stubs
