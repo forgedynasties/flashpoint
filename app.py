@@ -4,7 +4,7 @@ import re
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
     QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QProgressBar,
-    QPlainTextEdit, QCheckBox, QHeaderView, QSizePolicy
+    QCheckBox, QHeaderView, QSizePolicy
 )
 from PyQt6.QtCore import QTimer, Qt, QProcess, QRect
 from PyQt6.QtGui import QColor, QPen, QBrush
@@ -303,11 +303,10 @@ class FlashStation(QMainWindow):
         progress_layout.addWidget(progress)
         self.table.setCellWidget(row, COL_PROGRESS, progress_widget)
 
-        # Logs
-        log_box = QPlainTextEdit()
-        log_box.setReadOnly(True)
-        log_box.setMaximumBlockCount(500)
+        # Logs — single line, latest entry only
+        log_box = QLabel()
         log_box.setStyleSheet(Styles.get_log_box_style())
+        log_box.setContentsMargins(6, 0, 6, 0)
         self.table.setCellWidget(row, COL_LOGS, log_box)
 
         # Actions (Flash + EDL horizontal)
@@ -588,7 +587,7 @@ class FlashStation(QMainWindow):
         device_info["status_item"].setForeground(QColor(Colors.WARNING))
         device_info["progress"].setStyleSheet(Styles.get_progress_bar_style(Colors.WARNING))
         device_info["progress"].setValue(0)
-        device_info["log_box"].clear()
+        device_info["log_box"].setText("")
         self._update_ui_lock()
 
         process = QProcess()
@@ -601,7 +600,7 @@ class FlashStation(QMainWindow):
             for line in data.splitlines():
                 stripped = line.strip()
                 if stripped:
-                    device_info["log_box"].appendPlainText(stripped)
+                    device_info["log_box"].setText(stripped)
                     match = re.search(r"(\d+\.\d+)%", line)
                     if match:
                         device_info["progress"].setValue(min(int(float(match.group(1))), 100))

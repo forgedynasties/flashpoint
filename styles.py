@@ -252,14 +252,12 @@ class Styles:
 
     @staticmethod
     def get_log_box_style():
-        return f"""
-            background-color: {Colors.BG_BASE};
-            color: {Colors.TEXT_SECONDARY};
-            font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
-            font-size: 10px;
-            border: none;
-            padding: 4px;
-        """
+        return (
+            f"color: {Colors.TEXT_SECONDARY};"
+            "font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;"
+            "font-size: 10px;"
+            "background: transparent;"
+        )
 
     # legacy compat stubs
     @staticmethod
