@@ -4,9 +4,9 @@ import re
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
     QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QProgressBar,
-    QPlainTextEdit, QCheckBox
+    QPlainTextEdit, QCheckBox, QHeaderView, QStyleOptionButton, QStyle
 )
-from PyQt6.QtCore import QTimer, Qt, QProcess
+from PyQt6.QtCore import QTimer, Qt, QProcess, QRect
 
 from config import SCAN_INTERVAL_MS, FW_PATH_ENV
 from styles import Styles, Colors
@@ -24,6 +24,39 @@ COL_LOGS    = 6
 COL_ACTIONS = 7
 COL_REMOVE  = 8
 COL_COUNT   = 9
+
+
+class CheckboxHeader(QHeaderView):
+    """Header view that draws a real checkbox indicator in column 0."""
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self._checked = False
+        self.setSectionsClickable(True)
+
+    def set_check_state(self, checked: bool):
+        if self._checked != checked:
+            self._checked = checked
+            self.viewport().update()
+
+    def paintSection(self, painter, rect, logicalIndex):
+        painter.save()
+        super().paintSection(painter, rect, logicalIndex)
+        painter.restore()
+        if logicalIndex == 0:
+            opt = QStyleOptionButton()
+            size = 14
+            x = rect.x() + (rect.width() - size) // 2
+            y = rect.y() + (rect.height() - size) // 2
+            opt.rect = QRect(x, y, size, size)
+            opt.state = QStyle.StateFlag.State_Enabled
+            opt.state |= (
+                QStyle.StateFlag.State_On if self._checked
+                else QStyle.StateFlag.State_Off
+            )
+            self.style().drawPrimitive(
+                QStyle.PrimitiveElement.PE_IndicatorCheckBox, opt, painter
+            )
 
 
 class FlashStation(QMainWindow):
@@ -87,26 +120,6 @@ class FlashStation(QMainWindow):
         self.lbl_selected.setStyleSheet(f"color: {Colors.LIGHT_TEXT}; font-size: 11px;")
         layout.addWidget(self.lbl_selected)
 
-        # Selection buttons
-        btn_select_all = QPushButton("Select All")
-        btn_select_all.setFixedSize(90, 30)
-        btn_select_all.setStyleSheet(Styles.get_action_button_style())
-        btn_select_all.clicked.connect(self.select_all)
-
-        btn_deselect_all = QPushButton("Deselect All")
-        btn_deselect_all.setFixedSize(95, 30)
-        btn_deselect_all.setStyleSheet(Styles.get_action_button_style())
-        btn_deselect_all.clicked.connect(self.deselect_all)
-
-        btn_select_edl = QPushButton("Select EDL")
-        btn_select_edl.setFixedSize(90, 30)
-        btn_select_edl.setStyleSheet(Styles.get_action_button_style(Colors.EDL_MODE))
-        btn_select_edl.clicked.connect(self.select_edl_only)
-
-        layout.addWidget(btn_select_all)
-        layout.addWidget(btn_deselect_all)
-        layout.addWidget(btn_select_edl)
-
         # Divider spacing
         layout.addSpacing(10)
 
@@ -130,13 +143,15 @@ class FlashStation(QMainWindow):
         self.table = QTableWidget()
         self.table.setColumnCount(COL_COUNT)
         self.table.setHorizontalHeaderLabels([
-            "☑", "Serial", "Status", "ADB", "Build ID",
+            "", "Serial", "Status", "ADB", "Build ID",
             "Progress", "Logs", "Actions", "Remove"
         ])
 
-        self.table.horizontalHeader().setStretchLastSection(False)
+        self.check_header = CheckboxHeader(self.table)
+        self.table.setHorizontalHeader(self.check_header)
+        self.check_header.setStretchLastSection(False)
 
-        hdr = self.table.horizontalHeader()
+        hdr = self.check_header
         resize = hdr.ResizeMode
         fixed_cols = {
             COL_CHECK: 35, COL_SERIAL: 120, COL_STATUS: 70, COL_ADB: 40,
@@ -152,6 +167,8 @@ class FlashStation(QMainWindow):
         self.table.setStyleSheet(Styles.get_table_style())
         self.table.setSelectionBehavior(self.table.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(self.table.SelectionMode.NoSelection)
+
+        self.check_header.sectionClicked.connect(self._toggle_select_all)
 
         self.main_layout.addWidget(self.table)
 
@@ -240,7 +257,7 @@ class FlashStation(QMainWindow):
         chk_layout.addWidget(chk)
         chk_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         chk_layout.setContentsMargins(0, 0, 0, 0)
-        chk.stateChanged.connect(self._update_selection_label)
+        chk.clicked.connect(lambda checked, s=serial: self._on_checkbox_clicked(s, checked))
         self.table.setCellWidget(row, COL_CHECK, chk_widget)
 
         # Serial
@@ -328,8 +345,17 @@ class FlashStation(QMainWindow):
         self._update_selection_label()
 
     def update_device_status(self, device_info, status, has_adb, build_id):
+        old_status = device_info["status_item"].text()
         device_info["status_item"].setText(status)
         device_info["adb_item"].setText("on" if has_adb else "off")
+
+        # Silently uncheck devices that leave EDL mode
+        if old_status == "edl" and status != "edl" and device_info["chk"].isChecked():
+            chk = device_info["chk"]
+            chk.blockSignals(True)
+            chk.setChecked(False)
+            chk.blockSignals(False)
+            self._update_selection_label()
 
         if has_adb and build_id:
             device_info["build_id_item"].setText(build_id)
@@ -365,18 +391,76 @@ class FlashStation(QMainWindow):
         total = len(self.devices)
         checked = len(self._checked_serials())
         self.lbl_selected.setText(f"{checked} / {total} selected")
+        edl_devices = [s for s, d in self.devices.items() if d["status_item"].text() == "edl"]
+        all_edl_checked = bool(edl_devices) and all(self.devices[s]["chk"].isChecked() for s in edl_devices)
+        self.check_header.set_check_state(all_edl_checked)
 
-    def select_all(self):
-        for d in self.devices.values():
-            d["chk"].setChecked(True)
+    def _toggle_select_all(self, section):
+        if section != COL_CHECK:
+            return
+        edl_devices = [s for s, d in self.devices.items() if d["status_item"].text() == "edl"]
+        all_checked = bool(edl_devices) and all(self.devices[s]["chk"].isChecked() for s in edl_devices)
+        selecting = not all_checked
+        for s, d in self.devices.items():
+            chk = d["chk"]
+            chk.setChecked(False if not selecting else d["status_item"].text() == "edl")
+        self._update_selection_label()
+        if selecting:
+            non_edl_adb = [
+                s for s, d in self.devices.items()
+                if d["status_item"].text() != "edl" and d["adb_item"].text() == "on"
+            ]
+            if non_edl_adb:
+                self._show_edl_warning_multi(non_edl_adb)
 
-    def deselect_all(self):
-        for d in self.devices.values():
-            d["chk"].setChecked(False)
+    def _on_checkbox_clicked(self, serial, checked):
+        if serial not in self.devices:
+            return
+        device_info = self.devices[serial]
+        if checked and device_info["status_item"].text() != "edl":
+            # clicked signal fires after full click, so setChecked here is safe — no re-entrancy
+            device_info["chk"].setChecked(False)
+            self._show_edl_warning(serial)
+            return
+        self._update_selection_label()
 
-    def select_edl_only(self):
-        for d in self.devices.values():
-            d["chk"].setChecked(d["status_item"].text() == "edl")
+    def _show_edl_warning(self, serial):
+        if serial not in self.devices:
+            return
+        device_info = self.devices[serial]
+        has_adb = device_info["adb_item"].text() == "on"
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Device Not in EDL")
+        msg.setText(
+            f"Device <b>{serial}</b> is not in EDL mode.<br><br>"
+            "Only devices in EDL mode can be selected for flashing."
+        )
+        if has_adb:
+            msg.setInformativeText("Would you like to reboot this device to EDL mode now?")
+            btn_reboot = msg.addButton("Reboot to EDL", QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            if msg.clickedButton() == btn_reboot:
+                self.handle_edl_reboot(serial)
+        else:
+            msg.setInformativeText("Connect the device via ADB first to reboot it to EDL mode.")
+            msg.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+            msg.exec()
+
+    def _show_edl_warning_multi(self, serials):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Devices Not in EDL")
+        msg.setText(
+            f"{len(serials)} device(s) are not in EDL mode and were not selected."
+        )
+        msg.setInformativeText("Would you like to reboot them all to EDL mode now?")
+        btn_reboot = msg.addButton("Reboot All to EDL", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+        if msg.clickedButton() == btn_reboot:
+            for serial in serials:
+                self.handle_edl_reboot(serial)
 
     # ------------------------------------------------------------------
     # EDL reboot
@@ -401,6 +485,16 @@ class FlashStation(QMainWindow):
             if serial in self.adb_transports:
                 if self.devices[serial]["btn_edl"].isVisible():
                     self.handle_edl_reboot(serial)
+
+    # ------------------------------------------------------------------
+    # UI lock
+    # ------------------------------------------------------------------
+
+    def _any_flashing(self):
+        return any(p["is_flashing"] for p in self.device_processes.values())
+
+    def _update_ui_lock(self):
+        self.central_widget.setEnabled(not self._any_flashing())
 
     # ------------------------------------------------------------------
     # Flashing
@@ -474,6 +568,7 @@ class FlashStation(QMainWindow):
         device_info["status_item"].setText("flashing")
         device_info["progress"].setValue(0)
         device_info["log_box"].clear()
+        self._update_ui_lock()
 
         process = QProcess()
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -501,6 +596,8 @@ class FlashStation(QMainWindow):
             else:
                 device_info["status_item"].setText("failed")
                 device_info["progress"].setValue(0)
+
+            self._update_ui_lock()
 
         process.readyReadStandardOutput.connect(handle_output)
         process.finished.connect(lambda code: handle_finished(code))
