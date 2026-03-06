@@ -4,26 +4,26 @@ import re
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
     QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QProgressBar,
-    QPlainTextEdit, QCheckBox, QHeaderView, QStyleOptionButton, QStyle
+    QPlainTextEdit, QCheckBox, QHeaderView, QSizePolicy
 )
 from PyQt6.QtCore import QTimer, Qt, QProcess, QRect
+from PyQt6.QtGui import QColor, QPen, QBrush
 
 from config import SCAN_INTERVAL_MS, FW_PATH_ENV
-from styles import Styles, Colors
+from styles import Styles, Colors, STATUS_COLORS
 from utils_device_manager import DeviceScanner
 from utils_flash_manager import FlashManager, RebootManager
 
 # Column indices
-COL_CHECK   = 0
-COL_SERIAL  = 1
-COL_STATUS  = 2
-COL_ADB     = 3
-COL_BUILD   = 4
+COL_CHECK    = 0
+COL_SERIAL   = 1
+COL_STATUS   = 2
+COL_ADB      = 3
+COL_BUILD    = 4
 COL_PROGRESS = 5
-COL_LOGS    = 6
-COL_ACTIONS = 7
-COL_REMOVE  = 8
-COL_COUNT   = 9
+COL_LOGS     = 6
+COL_ACTIONS  = 7
+COL_COUNT    = 8
 
 
 class CheckboxHeader(QHeaderView):
@@ -44,19 +44,24 @@ class CheckboxHeader(QHeaderView):
         super().paintSection(painter, rect, logicalIndex)
         painter.restore()
         if logicalIndex == 0:
-            opt = QStyleOptionButton()
-            size = 14
+
+            size = 12
             x = rect.x() + (rect.width() - size) // 2
             y = rect.y() + (rect.height() - size) // 2
-            opt.rect = QRect(x, y, size, size)
-            opt.state = QStyle.StateFlag.State_Enabled
-            opt.state |= (
-                QStyle.StateFlag.State_On if self._checked
-                else QStyle.StateFlag.State_Off
+            box = QRect(x, y, size, size)
+            painter.setRenderHint(painter.RenderHint.Antialiasing)
+            # border
+            painter.setPen(QPen(QColor(Colors.BORDER_LIGHT), 1.5))
+            painter.setBrush(
+                QBrush(QColor(Colors.PRIMARY)) if self._checked
+                else QBrush(QColor(Colors.BG_ELEVATED))
             )
-            self.style().drawPrimitive(
-                QStyle.PrimitiveElement.PE_IndicatorCheckBox, opt, painter
-            )
+            painter.drawRoundedRect(box, 2, 2)
+            # checkmark
+            if self._checked:
+                painter.setPen(QPen(QColor(Colors.WHITE), 1.8))
+                painter.drawLine(x + 2, y + 6, x + 5, y + 9)
+                painter.drawLine(x + 5, y + 9, x + 10, y + 3)
 
 
 class FlashStation(QMainWindow):
@@ -65,8 +70,8 @@ class FlashStation(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Qualcomm Flash Station")
-        self.setMinimumSize(1100, 600)
-        self.setGeometry(100, 100, 1100, 600)
+        self.setMinimumSize(1000, 600)
+        self.setGeometry(100, 100, 1200, 700)
 
         self.devices = {}
         self.adb_transports = {}
@@ -95,8 +100,10 @@ class FlashStation(QMainWindow):
         layout.setSpacing(10)
 
         # Firmware section
-        fw_label = QLabel("Firmware:")
-        fw_label.setStyleSheet(f"color: {Colors.DARK_TEXT}; font-weight: bold;")
+        fw_label = QLabel("FIRMWARE")
+        fw_label.setStyleSheet(
+            f"color: {Colors.TEXT_SECONDARY}; font-weight: 700; font-size: 10px; letter-spacing: 0.8px;"
+        )
 
         self.fw_combo = QComboBox()
         self.fw_combo.setMinimumWidth(300)
@@ -105,8 +112,7 @@ class FlashStation(QMainWindow):
         self.load_env_firmwares()
 
         btn_browse = QPushButton("Browse")
-        btn_browse.setFixedSize(70, 30)
-        btn_browse.setStyleSheet(Styles.get_action_button_style())
+        btn_browse.setStyleSheet(Styles.get_outlined_button_style(Colors.PRIMARY))
         btn_browse.clicked.connect(self.pick_folder)
 
         layout.addWidget(fw_label)
@@ -117,7 +123,9 @@ class FlashStation(QMainWindow):
 
         # Selection count label
         self.lbl_selected = QLabel("0 / 0 selected")
-        self.lbl_selected.setStyleSheet(f"color: {Colors.LIGHT_TEXT}; font-size: 11px;")
+        self.lbl_selected.setStyleSheet(
+            f"color: {Colors.TEXT_SECONDARY}; font-size: 11px; letter-spacing: 0.3px;"
+        )
         layout.addWidget(self.lbl_selected)
 
         # Divider spacing
@@ -125,12 +133,10 @@ class FlashStation(QMainWindow):
 
         # Flash / reboot buttons
         self.btn_reboot_all_edl = QPushButton("Reboot All to EDL")
-        self.btn_reboot_all_edl.setFixedSize(130, 30)
-        self.btn_reboot_all_edl.setStyleSheet(Styles.get_action_button_style(Colors.EDL_MODE))
+        self.btn_reboot_all_edl.setStyleSheet(Styles.get_outlined_button_style(Colors.EDL_MODE))
         self.btn_reboot_all_edl.clicked.connect(self.reboot_all_to_edl)
 
         self.btn_start_all = QPushButton("Flash Selected")
-        self.btn_start_all.setFixedSize(110, 30)
         self.btn_start_all.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
         self.btn_start_all.clicked.connect(self.flash_all_ready)
 
@@ -144,7 +150,7 @@ class FlashStation(QMainWindow):
         self.table.setColumnCount(COL_COUNT)
         self.table.setHorizontalHeaderLabels([
             "", "Serial", "Status", "ADB", "Build ID",
-            "Progress", "Logs", "Actions", "Remove"
+            "Progress", "Logs", "Actions",
         ])
 
         self.check_header = CheckboxHeader(self.table)
@@ -154,15 +160,18 @@ class FlashStation(QMainWindow):
         hdr = self.check_header
         resize = hdr.ResizeMode
         fixed_cols = {
-            COL_CHECK: 35, COL_SERIAL: 120, COL_STATUS: 70, COL_ADB: 40,
-            COL_BUILD: 120, COL_PROGRESS: 100, COL_ACTIONS: 110, COL_REMOVE: 50
+            COL_CHECK: 42, COL_SERIAL: 130, COL_STATUS: 90, COL_ADB: 55,
+            COL_BUILD: 160, COL_LOGS: 220, COL_ACTIONS: 140,
         }
         for col, width in fixed_cols.items():
             hdr.setSectionResizeMode(col, resize.Fixed)
             self.table.setColumnWidth(col, width)
-        hdr.setSectionResizeMode(COL_LOGS, resize.Stretch)
+        hdr.setSectionResizeMode(COL_PROGRESS, resize.Stretch)
 
-        self.table.verticalHeader().setDefaultSectionSize(50)
+        vh = self.table.verticalHeader()
+        vh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        vh.setDefaultSectionSize(36)
+        vh.setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet(Styles.get_table_style())
         self.table.setSelectionBehavior(self.table.SelectionBehavior.SelectRows)
@@ -252,7 +261,9 @@ class FlashStation(QMainWindow):
         # Checkbox column
         chk = QCheckBox()
         chk.setChecked(False)
+        chk.setStyleSheet(Styles.get_checkbox_style())
         chk_widget = QWidget()
+        chk_widget.setStyleSheet(f"background: transparent;")
         chk_layout = QHBoxLayout(chk_widget)
         chk_layout.addWidget(chk)
         chk_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -283,46 +294,47 @@ class FlashStation(QMainWindow):
         # Progress
         progress = QProgressBar()
         progress.setValue(0)
+        progress.setTextVisible(True)
         progress.setStyleSheet(Styles.get_progress_bar_style())
-        self.table.setCellWidget(row, COL_PROGRESS, progress)
+        progress_widget = QWidget()
+        progress_widget.setStyleSheet("background: transparent;")
+        progress_layout = QVBoxLayout(progress_widget)
+        progress_layout.setContentsMargins(6, 0, 6, 0)
+        progress_layout.addWidget(progress)
+        self.table.setCellWidget(row, COL_PROGRESS, progress_widget)
 
         # Logs
         log_box = QPlainTextEdit()
         log_box.setReadOnly(True)
         log_box.setMaximumBlockCount(500)
-        log_box.setStyleSheet(
-            f"background: {Colors.WHITE}; color: {Colors.LIGHT_TEXT};"
-            "font-family: monospace; font-size: 10px; border: none; padding: 2px;"
-        )
+        log_box.setStyleSheet(Styles.get_log_box_style())
         self.table.setCellWidget(row, COL_LOGS, log_box)
 
-        # Actions (Flash + EDL)
+        # Actions (Flash + EDL horizontal)
         action_widget = QWidget()
+        action_widget.setStyleSheet("background: transparent;")
         action_layout = QHBoxLayout(action_widget)
-        action_layout.setContentsMargins(2, 2, 2, 2)
+        action_layout.setContentsMargins(4, 4, 4, 4)
         action_layout.setSpacing(4)
 
+        _exp = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
         btn_flash = QPushButton("Flash")
-        btn_flash.setMaximumWidth(60)
+        btn_flash.setMinimumWidth(52)
+        btn_flash.setSizePolicy(_exp)
         btn_flash.setStyleSheet(Styles.get_action_button_style(Colors.PRIMARY))
         btn_flash.clicked.connect(lambda: self.handle_manual_flash(serial))
 
         btn_edl = QPushButton("EDL")
-        btn_edl.setMaximumWidth(50)
-        btn_edl.setStyleSheet(Styles.get_action_button_style(Colors.EDL_MODE))
+        btn_edl.setMinimumWidth(46)
+        btn_edl.setSizePolicy(_exp)
+        btn_edl.setStyleSheet(Styles.get_outlined_button_style(Colors.EDL_MODE))
         btn_edl.clicked.connect(lambda: self.handle_edl_reboot(serial))
         btn_edl.hide()
 
         action_layout.addWidget(btn_flash)
         action_layout.addWidget(btn_edl)
         self.table.setCellWidget(row, COL_ACTIONS, action_widget)
-
-        # Remove
-        btn_remove = QPushButton("X")
-        btn_remove.setMaximumWidth(50)
-        btn_remove.setStyleSheet(Styles.get_remove_button_style())
-        btn_remove.clicked.connect(lambda: self.remove_device(serial))
-        self.table.setCellWidget(row, COL_REMOVE, btn_remove)
 
         self.devices[serial] = {
             "row": row,
@@ -347,7 +359,14 @@ class FlashStation(QMainWindow):
     def update_device_status(self, device_info, status, has_adb, build_id):
         old_status = device_info["status_item"].text()
         device_info["status_item"].setText(status)
-        device_info["adb_item"].setText("on" if has_adb else "off")
+        device_info["status_item"].setForeground(
+            QColor(STATUS_COLORS.get(status, Colors.TEXT_SECONDARY))
+        )
+        adb_text = "on" if has_adb else "off"
+        device_info["adb_item"].setText(adb_text)
+        device_info["adb_item"].setForeground(
+            QColor(Colors.SUCCESS if has_adb else Colors.TEXT_DIM)
+        )
 
         # Silently uncheck devices that leave EDL mode
         if old_status == "edl" and status != "edl" and device_info["chk"].isChecked():
@@ -566,6 +585,8 @@ class FlashStation(QMainWindow):
         device_info["btn_flash"].setEnabled(False)
         device_info["btn_edl"].setEnabled(False)
         device_info["status_item"].setText("flashing")
+        device_info["status_item"].setForeground(QColor(Colors.WARNING))
+        device_info["progress"].setStyleSheet(Styles.get_progress_bar_style(Colors.WARNING))
         device_info["progress"].setValue(0)
         device_info["log_box"].clear()
         self._update_ui_lock()
@@ -592,10 +613,14 @@ class FlashStation(QMainWindow):
 
             if exit_code == 0:
                 device_info["status_item"].setText("success")
+                device_info["status_item"].setForeground(QColor(Colors.SUCCESS))
                 device_info["progress"].setValue(100)
+                device_info["progress"].setStyleSheet(Styles.get_progress_bar_style(Colors.SUCCESS))
             else:
                 device_info["status_item"].setText("failed")
+                device_info["status_item"].setForeground(QColor(Colors.ERROR))
                 device_info["progress"].setValue(0)
+                device_info["progress"].setStyleSheet(Styles.get_progress_bar_style(Colors.ERROR))
 
             self._update_ui_lock()
 
