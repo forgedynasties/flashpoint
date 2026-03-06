@@ -36,6 +36,26 @@ class DeviceScanner:
         return usb_to_tid
     
     @staticmethod
+    def get_build_id(usb_path):
+        """Get build ID from device via ADB using USB path.
+        
+        Args:
+            usb_path: USB port location (e.g., "1-2")
+            
+        Returns:
+            Build ID string or empty string if not available
+        """
+        try:
+            output = subprocess.check_output(
+                ["adb", "-s", f"usb:{usb_path}", "shell", "getprop", "ro.build.id"],
+                stderr=subprocess.DEVNULL,
+                timeout=2
+            ).decode().strip()
+            return output if output else ""
+        except:
+            return ""
+    
+    @staticmethod
     def get_booted_devices():
         """Scan for booted devices (USER/DEBUG modes)."""
         devices = {}
@@ -104,5 +124,11 @@ class DeviceScanner:
         for serial, info in booted_devices.items():
             currently_connected.add(serial)
             devices_info[serial] = info
+            
+            # Get build_id if ADB is available, using USB path
+            if info.get("has_adb") and "path" in info:
+                build_id = DeviceScanner.get_build_id(info["path"])
+                if build_id:
+                    devices_info[serial]["build_id"] = build_id
         
         return currently_connected, devices_info
