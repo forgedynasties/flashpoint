@@ -195,10 +195,12 @@ class FactoryStation(QMainWindow):
     def _scan(self):
         connected, info_map = DeviceScanner.scan_all()
 
-        # Add new devices not yet in the table
+        # Add new devices not yet in the table — only if already in EDL
         for serial in connected:
             if serial not in self.devices:
-                self._add_row(serial)
+                info = info_map.get(serial, {})
+                if "edl" in info.get("mode", "").lower():
+                    self._add_row(serial)
 
         # Update per-device state from scan results
         for serial, info in info_map.items():
@@ -557,16 +559,12 @@ class FactoryStation(QMainWindow):
         btn_close.setStyleSheet(Styles.get_outlined_button_style(Colors.TEXT_SECONDARY))
         btn_close.clicked.connect(dlg.accept)
 
-        btn_new = QPushButton("New Cycle")
-        btn_new.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
-        btn_new.clicked.connect(lambda: (self._new_cycle(), dlg.accept()))
-
         btn_row.addWidget(btn_copy)
         btn_row.addStretch()
         btn_row.addWidget(btn_close)
-        btn_row.addWidget(btn_new)
         layout.addLayout(btn_row)
 
+        dlg.finished.connect(self._auto_new_cycle)
         dlg.exec()
 
     def _save_report(self, text: str, started: datetime):
@@ -587,6 +585,80 @@ class FactoryStation(QMainWindow):
         self.run_serials.clear()
         self._update_summary()
         self._update_start_btn()
+
+    def _auto_new_cycle(self):
+        """Called when the report dialog closes — clear state then wait for next batch."""
+        self._new_cycle()
+        self._show_replug_dialog()
+
+    def _show_replug_dialog(self):
+        """Modal dialog asking operator to plug in next batch in EDL."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Next Batch")
+        dlg.setMinimumWidth(400)
+        dlg.setStyleSheet(
+            f"background-color: {Colors.BG_SURFACE}; color: {Colors.TEXT_PRIMARY};"
+        )
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 24, 24, 20)
+        layout.setSpacing(14)
+
+        title = QLabel("Replug Devices for Next Batch")
+        title.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; font-size: 14px; font-weight: 700;"
+        )
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        instr = QLabel("Connect all devices in EDL mode.")
+        instr.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 11px;")
+        instr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(instr)
+
+        count_lbl = QLabel("Waiting for EDL devices…")
+        count_lbl.setStyleSheet(
+            f"color: {Colors.EDL_MODE}; font-size: 13px; font-weight: 600;"
+        )
+        count_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(count_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_start = QPushButton("Start Now")
+        btn_start.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
+        btn_start.setEnabled(False)
+        btn_start.clicked.connect(dlg.accept)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(Styles.get_outlined_button_style(Colors.TEXT_SECONDARY))
+        btn_cancel.clicked.connect(dlg.reject)
+
+        btn_row.addStretch()
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_start)
+        layout.addLayout(btn_row)
+
+        # Poll for EDL devices using the scan timer
+        poll = QTimer(dlg)
+        def _check_edl():
+            edl_count = sum(
+                1 for d in self.devices.values() if d["is_edl"]
+            )
+            if edl_count:
+                count_lbl.setText(f"{edl_count} device{'s' if edl_count > 1 else ''} in EDL — ready")
+                btn_start.setEnabled(True)
+            else:
+                count_lbl.setText("Waiting for EDL devices…")
+                btn_start.setEnabled(False)
+
+        poll.timeout.connect(_check_edl)
+        poll.start(SCAN_INTERVAL_MS)
+
+        result = dlg.exec()
+        poll.stop()
+
+        if result == QDialog.DialogCode.Accepted:
+            QTimer.singleShot(100, self._start_run)
 
     # ── Header helpers ─────────────────────────────────────────────────────────
 
