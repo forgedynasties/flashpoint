@@ -1,7 +1,13 @@
-"""Factory Assembly Flash Station — automated 3-stage flashing pipeline."""
+"""Factory Assembly Flash Station — serial-keyed 3-stage pipeline.
+
+Devices are keyed by serial throughout (matching app.py). ADB transport IDs
+are looked up by serial from 'adb devices -l' rather than by USB path, which
+avoids path-matching failures that caused BOOTING timeouts when the sysfs
+path and ADB-reported path didn't agree.
+"""
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QTableWidget, QTableWidgetItem, QProgressBar,
@@ -21,7 +27,7 @@ from styles import Styles, Colors
 from utils_device_manager import DeviceScanner
 from utils_flash_manager import FlashManager, RebootManager
 
-# ── Pipeline states ────────────────────────────────────────────────────────────
+# ── Pipeline states ─────────────────────────────────────────────────────────────
 S_WAITING       = "WAITING"
 S_SKIPPED       = "SKIPPED"
 S_FLASH1        = "FLASH 1/3"
@@ -58,7 +64,6 @@ STAGE_LABEL = {
     S_TIMEOUT:       "✗",
 }
 
-# ── Columns ────────────────────────────────────────────────────────────────────
 COL_SERIAL   = 0
 COL_STAGE    = 1
 COL_STATUS   = 2
@@ -68,7 +73,7 @@ COL_COUNT    = 5
 
 
 class FactoryStation(QMainWindow):
-    """Factory assembly flash station — automated 3-stage pipeline."""
+    """Factory assembly flash station — serial-keyed 3-stage pipeline."""
 
     def __init__(self):
         super().__init__()
@@ -76,26 +81,22 @@ class FactoryStation(QMainWindow):
         self.setMinimumSize(900, 500)
         self.setGeometry(100, 100, 1100, 650)
 
-        # Firmware paths from env
-        self.factory_fw  = os.getenv(FACTORY_FW_PATH_ENV, "")
-        self.prod_fw     = os.getenv(PROD_DEBUG_FW_PATH_ENV, "")
-        self.boot_timeout_ms = int(os.getenv(BOOT_TIMEOUT_SEC_ENV,
-                                             DEFAULT_BOOT_TIMEOUT_SEC)) * 1000
-
-        # Reports directory
+        self.factory_fw      = os.getenv(FACTORY_FW_PATH_ENV, "")
+        self.prod_fw         = os.getenv(PROD_DEBUG_FW_PATH_ENV, "")
+        self.boot_timeout_ms = int(os.getenv(
+            BOOT_TIMEOUT_SEC_ENV, DEFAULT_BOOT_TIMEOUT_SEC)) * 1000
         self.reports_dir = os.getenv(FACTORY_REPORTS_DIR_ENV, DEFAULT_REPORTS_DIR)
 
-        # State
-        self.devices     = {}   # serial → device dict
-        self.adb_map     = {}   # serial → adb transport id
+        # Keyed by device serial
+        self.devices     = {}
         self.run_active  = False
         self.run_serials = set()
-        self.cycle_start: datetime | None = None
+        self.cycle_start = None
 
         self._setup_ui()
         self._setup_scanning()
 
-    # ── UI setup ───────────────────────────────────────────────────────────────
+    # ── UI setup ────────────────────────────────────────────────────────────────
 
     def _setup_ui(self):
         root = QWidget()
@@ -104,7 +105,6 @@ class FactoryStation(QMainWindow):
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self._root = root
         self._setup_header(layout)
         self._setup_table(layout)
 
@@ -123,8 +123,7 @@ class FactoryStation(QMainWindow):
             )
             val = QLabel(path if path else "NOT SET — check env var")
             val.setStyleSheet(
-                f"color: {Colors.TEXT_PRIMARY if path else Colors.ERROR};"
-                "font-size: 11px;"
+                f"color: {Colors.TEXT_PRIMARY if path else Colors.ERROR}; font-size: 11px;"
             )
             box = QVBoxLayout()
             box.setSpacing(2)
@@ -190,62 +189,43 @@ class FactoryStation(QMainWindow):
         self.timer.timeout.connect(self._scan)
         self.timer.start(SCAN_INTERVAL_MS)
 
-    # ── Scanning ───────────────────────────────────────────────────────────────
+    # ── Scanning ────────────────────────────────────────────────────────────────
 
     def _scan(self):
-        connected, info_map = DeviceScanner.scan_all()
+        edl_devices   = DeviceScanner.get_edl_devices()    # {serial: path}
+        adb_by_serial = DeviceScanner.get_adb_serial_map() # {serial: tid}
 
-        # Add new devices not yet in the table — only if already in EDL
-        for serial in connected:
+        # Register new EDL devices not yet in the table
+        for serial in edl_devices:
             if serial not in self.devices:
-                info = info_map.get(serial, {})
-                if "edl" in info.get("mode", "").lower():
-                    self._add_row(serial)
+                self._add_row(serial)
 
-        # Update per-device state from scan results
-        for serial, info in info_map.items():
-            if serial not in self.devices:
-                continue
-            dev = self.devices[serial]
-            mode    = info["mode"].lower()
-            has_adb = info.get("has_adb", False)
-            build_id = info.get("build_id", "")
-
-            # Track ADB transport id
-            if "adb_tid" in info:
-                self.adb_map[serial] = info["adb_tid"]
-
-            # Update is_edl flag (used by Start button and pipeline)
-            dev["is_edl"] = "edl" in mode
-
+        # Advance state machine for each tracked device
+        for serial in list(self.devices.keys()):
+            dev   = self.devices[serial]
             state = dev["state"]
 
-            if state == S_BOOTING:
-                if has_adb and build_id:
-                    self._cancel_boot_timer(serial)
-                    if build_id == EXPECTED_BUILD_ID:
-                        self._set_state(serial, S_REBOOTING_EDL)
-                        if serial in self.adb_map:
-                            RebootManager.reboot_to_edl(self.adb_map[serial])
-                    else:
-                        self._set_failed(serial,
-                                         f"Build ID mismatch: got {build_id!r}")
+            if state == S_WAITING:
+                if serial in edl_devices:
+                    dev["is_edl"] = True
+                else:
+                    # Unplugged before run started
+                    self._remove_row(serial)
+
+            elif state == S_BOOTING:
+                # Device serial appears in ADB → it has booted
+                if serial in adb_by_serial:
+                    self._check_build_id(serial, adb_by_serial[serial])
 
             elif state == S_REBOOTING_EDL:
-                if dev["is_edl"]:
+                # Waiting for device to come back as EDL
+                if serial in edl_devices:
                     self._start_flash(serial, stage=3)
-
-        # Remove WAITING devices that have disconnected (not part of any run)
-        for serial in list(self.devices.keys()):
-            if serial not in connected:
-                dev = self.devices[serial]
-                if dev["state"] == S_WAITING:
-                    self._remove_row(serial)
 
         self._update_start_btn()
         self._update_summary()
 
-    # ── Row management ─────────────────────────────────────────────────────────
+    # ── Row management ──────────────────────────────────────────────────────────
 
     def _add_row(self, serial):
         row = self.table.rowCount()
@@ -267,7 +247,6 @@ class FactoryStation(QMainWindow):
         self.table.setItem(row, COL_STAGE,   stage_item)
         self.table.setItem(row, COL_STATUS,  status_item)
 
-        # Progress bar
         progress = QProgressBar()
         progress.setRange(0, 100)
         progress.setValue(0)
@@ -280,35 +259,33 @@ class FactoryStation(QMainWindow):
         pl.addWidget(progress)
         self.table.setCellWidget(row, COL_PROGRESS, pw)
 
-        # Log label
         log_lbl = QLabel()
         log_lbl.setStyleSheet(Styles.get_log_box_style())
         log_lbl.setContentsMargins(6, 0, 6, 0)
         self.table.setCellWidget(row, COL_LOG, log_lbl)
 
         self.devices[serial] = {
-            "row":         row,
-            "state":       S_WAITING,
-            "fail_reason": "",
-            "is_edl":      False,
-            "stage_item":  stage_item,
-            "status_item": status_item,
-            "progress":    progress,
-            "log_lbl":     log_lbl,
-            "process":     None,
-            "boot_timer":  None,
+            "row":           row,
+            "state":         S_WAITING,
+            "fail_reason":   "",
+            "is_edl":        True,
+            "stage_item":    stage_item,
+            "status_item":   status_item,
+            "progress":      progress,
+            "log_lbl":       log_lbl,
+            "process":       None,
+            "boot_timer":    None,
+            "build_id_proc": None,
         }
 
     def _remove_row(self, serial):
         dev = self.devices.pop(serial)
         self.table.removeRow(dev["row"])
-        # Fix row indices for remaining devices
         for d in self.devices.values():
             if d["row"] > dev["row"]:
                 d["row"] -= 1
-        self.adb_map.pop(serial, None)
 
-    # ── State machine ──────────────────────────────────────────────────────────
+    # ── State machine ────────────────────────────────────────────────────────────
 
     def _set_state(self, serial, state, fail_reason=""):
         dev = self.devices[serial]
@@ -316,12 +293,13 @@ class FactoryStation(QMainWindow):
         dev["fail_reason"] = fail_reason
 
         dev["status_item"].setText(state)
-        dev["status_item"].setForeground(QColor(STATE_COLORS.get(state, Colors.TEXT_SECONDARY)))
+        dev["status_item"].setForeground(
+            QColor(STATE_COLORS.get(state, Colors.TEXT_SECONDARY))
+        )
         dev["stage_item"].setText(STAGE_LABEL.get(state, "—"))
 
-        # Progress bar appearance
         if state in (S_BOOTING, S_REBOOTING_EDL):
-            dev["progress"].setRange(0, 0)   # indeterminate spinner
+            dev["progress"].setRange(0, 0)
         elif state == S_DONE:
             dev["progress"].setRange(0, 100)
             dev["progress"].setValue(100)
@@ -345,12 +323,11 @@ class FactoryStation(QMainWindow):
         self._set_state(serial, S_FAILED, reason)
         self._check_complete()
 
-    # ── Run control ────────────────────────────────────────────────────────────
+    # ── Run control ──────────────────────────────────────────────────────────────
 
     def _start_run(self):
         if self.run_active:
             return
-
         self.run_active  = True
         self.run_serials = set(self.devices.keys())
         self.cycle_start = datetime.now()
@@ -372,6 +349,7 @@ class FactoryStation(QMainWindow):
     def _stop_run(self):
         for serial, dev in self.devices.items():
             self._cancel_boot_timer(serial)
+            self._cancel_build_id_check(serial)
             proc = dev.get("process")
             if proc and proc.state() != QProcess.ProcessState.NotRunning:
                 proc.kill()
@@ -386,21 +364,28 @@ class FactoryStation(QMainWindow):
         self.btn_start.setText("Start")
         self._update_summary()
 
-    # ── Flash ──────────────────────────────────────────────────────────────────
+    # ── Flash ────────────────────────────────────────────────────────────────────
 
-    def _start_flash(self, serial, stage: int):
+    def _start_flash(self, serial, stage):
         dev = self.devices[serial]
+
+        # Guard against re-entry (scan calls this for stage 3 every cycle)
+        if stage == 1 and dev["state"] == S_FLASH1:
+            return
+        if stage == 3 and dev["state"] == S_FLASH3:
+            return
+
         fw_path = self.factory_fw if stage == 1 else self.prod_fw
-        state   = S_FLASH1       if stage == 1 else S_FLASH3
+        state   = S_FLASH1        if stage == 1 else S_FLASH3
 
         prog, raw, patch = FlashManager.find_firmware_files(fw_path)
         if not (prog and raw and patch):
-            self._set_failed(serial,
-                             f"Stage {stage} firmware not found in: {fw_path}")
+            self._set_failed(serial, f"Stage {stage} firmware not found in: {fw_path}")
             return
 
         self._set_state(serial, state)
         dev["log_lbl"].setText("")
+        dev["is_edl"] = False
 
         process = QProcess()
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -417,7 +402,7 @@ class FactoryStation(QMainWindow):
                 if m:
                     dev["progress"].setValue(min(int(float(m.group(1))), 100))
 
-        def on_finished(code):
+        def on_finished(code, _status):
             dev["process"] = None
             if code == 0:
                 dev["progress"].setValue(100)
@@ -433,12 +418,52 @@ class FactoryStation(QMainWindow):
             self._check_complete()
 
         process.readyReadStandardOutput.connect(on_output)
-        process.finished.connect(lambda code: on_finished(code))
+        process.finished.connect(on_finished)
         args = FlashManager.build_flash_command(serial, prog, raw, patch)
         process.setWorkingDirectory(FlashManager.get_working_directory(raw))
         process.start(args[0], args[1:])
 
-    # ── Boot timer ─────────────────────────────────────────────────────────────
+    # ── Build ID check (non-blocking QProcess) ───────────────────────────────────
+
+    def _check_build_id(self, serial, tid):
+        """Start an async adb getprop. No-ops if one is already in flight.
+        Retries each scan cycle until ADB responds with output."""
+        dev = self.devices.get(serial)
+        if not dev or dev.get("build_id_proc"):
+            return
+
+        proc = QProcess()
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        dev["build_id_proc"] = proc
+
+        def on_finished(code, _status):
+            if serial not in self.devices:
+                return
+            dev["build_id_proc"] = None
+            if dev["state"] != S_BOOTING:
+                return
+            output = proc.readAllStandardOutput().data().decode().strip()
+            if not output:
+                return   # ADB not ready yet — retry next scan cycle
+            self._cancel_boot_timer(serial)
+            if output == EXPECTED_BUILD_ID:
+                self._set_state(serial, S_REBOOTING_EDL)
+                dev["log_lbl"].setText("Rebooting to EDL…")
+                RebootManager.reboot_to_edl(tid)
+            else:
+                self._set_failed(serial, f"Build ID mismatch: {output!r}")
+
+        proc.finished.connect(on_finished)
+        proc.start("adb", ["-t", tid, "shell", "getprop", "ro.build.id"])
+
+    def _cancel_build_id_check(self, serial):
+        dev = self.devices.get(serial, {})
+        p = dev.get("build_id_proc")
+        if p and p.state() != QProcess.ProcessState.NotRunning:
+            p.kill()
+        dev["build_id_proc"] = None
+
+    # ── Boot timer ───────────────────────────────────────────────────────────────
 
     def _start_boot_timer(self, serial):
         timer = QTimer()
@@ -457,10 +482,10 @@ class FactoryStation(QMainWindow):
     def _on_boot_timeout(self, serial):
         if serial in self.devices and self.devices[serial]["state"] == S_BOOTING:
             self._set_state(serial, S_TIMEOUT,
-                            f"Device did not boot within {self.boot_timeout_ms // 1000}s")
+                            f"No boot within {self.boot_timeout_ms // 1000}s")
             self._check_complete()
 
-    # ── Session complete ───────────────────────────────────────────────────────
+    # ── Session complete ──────────────────────────────────────────────────────────
 
     def _check_complete(self):
         if not self.run_active:
@@ -477,53 +502,49 @@ class FactoryStation(QMainWindow):
             self._update_summary()
             QTimer.singleShot(400, self._show_report)
 
-    # ── Report dialog ──────────────────────────────────────────────────────────
+    # ── Report dialog ─────────────────────────────────────────────────────────────
 
     def _show_report(self):
-        now       = datetime.now()
-        started   = self.cycle_start or now
-        elapsed   = now - started
-        total_sec = int(elapsed.total_seconds())
-        duration  = f"{total_sec // 60}m {total_sec % 60}s"
-        ts_label  = started.strftime("%Y-%m-%d  %H:%M:%S")
+        now     = datetime.now()
+        started = self.cycle_start or now
+        elapsed = now - started
+        total   = int(elapsed.total_seconds())
+        dur     = f"{total // 60}m {total % 60}s"
+        ts      = started.strftime("%Y-%m-%d  %H:%M:%S")
 
-        done = skipped = failed = timeout = 0
-        lines = []
+        counts = {S_DONE: 0, S_FAILED: 0, S_TIMEOUT: 0, S_SKIPPED: 0}
+        lines  = []
         for serial in sorted(self.run_serials):
             dev = self.devices.get(serial)
             if not dev:
                 continue
             state  = dev["state"]
             reason = dev["fail_reason"]
-            if state == S_DONE:             done    += 1
-            elif state == S_SKIPPED:        skipped += 1
-            elif state == S_TIMEOUT:        timeout += 1
-            elif state == S_FAILED:         failed  += 1
+            if state in counts:
+                counts[state] += 1
             suffix = f"  —  {reason}" if reason else ""
             lines.append(f"{serial:<22}  {state:<14}{suffix}")
 
         summary = (
-            f"  DONE: {done}    FAILED: {failed}"
-            f"    TIMEOUT: {timeout}    SKIPPED: {skipped}"
+            f"  DONE: {counts[S_DONE]}    FAILED: {counts[S_FAILED]}"
+            f"    TIMEOUT: {counts[S_TIMEOUT]}    SKIPPED: {counts[S_SKIPPED]}"
         )
         report_text = (
-            f"Cycle started : {ts_label}\n"
-            f"Duration      : {duration}\n"
+            f"Cycle started : {ts}\n"
+            f"Duration      : {dur}\n"
             f"Devices       : {len(self.run_serials)}\n"
             + summary + "\n"
             + "─" * 60 + "\n"
             + "\n".join(lines)
         )
-
         self._save_report(report_text, started)
 
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Session Report  —  {duration}")
+        dlg.setWindowTitle(f"Session Report  —  {dur}")
         dlg.setMinimumWidth(620)
         dlg.setStyleSheet(
             f"background-color: {Colors.BG_SURFACE}; color: {Colors.TEXT_PRIMARY};"
         )
-
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
@@ -534,7 +555,9 @@ class FactoryStation(QMainWindow):
         )
         layout.addWidget(title)
 
-        meta = QLabel(f"Started {ts_label}   ·   Duration {duration}   ·   {len(self.run_serials)} devices")
+        meta = QLabel(
+            f"Started {ts}   ·   Duration {dur}   ·   {len(self.run_serials)} devices"
+        )
         meta.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 11px;")
         layout.addWidget(meta)
 
@@ -552,13 +575,10 @@ class FactoryStation(QMainWindow):
         btn_row = QHBoxLayout()
         btn_copy = QPushButton("Copy to Clipboard")
         btn_copy.setStyleSheet(Styles.get_outlined_button_style(Colors.PRIMARY))
-        btn_copy.clicked.connect(
-            lambda: QApplication.clipboard().setText(report_text)
-        )
+        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(report_text))
         btn_close = QPushButton("Close")
         btn_close.setStyleSheet(Styles.get_outlined_button_style(Colors.TEXT_SECONDARY))
         btn_close.clicked.connect(dlg.accept)
-
         btn_row.addWidget(btn_copy)
         btn_row.addStretch()
         btn_row.addWidget(btn_close)
@@ -567,18 +587,16 @@ class FactoryStation(QMainWindow):
         dlg.finished.connect(self._auto_new_cycle)
         dlg.exec()
 
-    def _save_report(self, text: str, started: datetime):
+    def _save_report(self, text, started):
         try:
             os.makedirs(self.reports_dir, exist_ok=True)
-            filename = f"cycle_{started.strftime('%Y%m%d_%H%M%S')}.txt"
-            path = os.path.join(self.reports_dir, filename)
-            with open(path, "w") as f:
+            fname = f"cycle_{started.strftime('%Y%m%d_%H%M%S')}.txt"
+            with open(os.path.join(self.reports_dir, fname), "w") as f:
                 f.write(text + "\n")
         except Exception as e:
             print(f"[factory] could not save report: {e}")
 
     def _new_cycle(self):
-        """Clear all terminal-state devices and reset for the next batch."""
         for serial in list(self.devices.keys()):
             if self.devices[serial]["state"] in TERMINAL:
                 self._remove_row(serial)
@@ -587,19 +605,16 @@ class FactoryStation(QMainWindow):
         self._update_start_btn()
 
     def _auto_new_cycle(self):
-        """Called when the report dialog closes — clear state then wait for next batch."""
         self._new_cycle()
         self._show_replug_dialog()
 
     def _show_replug_dialog(self):
-        """Modal dialog asking operator to plug in next batch in EDL."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Next Batch")
         dlg.setMinimumWidth(400)
         dlg.setStyleSheet(
             f"background-color: {Colors.BG_SURFACE}; color: {Colors.TEXT_PRIMARY};"
         )
-
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(24, 24, 24, 20)
         layout.setSpacing(14)
@@ -611,7 +626,7 @@ class FactoryStation(QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
-        instr = QLabel("Connect all devices in EDL mode.")
+        instr = QLabel("Connect all devices in EDL mode, then press Start.")
         instr.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 11px;")
         instr.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(instr)
@@ -628,45 +643,38 @@ class FactoryStation(QMainWindow):
         btn_start.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
         btn_start.setEnabled(False)
         btn_start.clicked.connect(dlg.accept)
-
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setStyleSheet(Styles.get_outlined_button_style(Colors.TEXT_SECONDARY))
         btn_cancel.clicked.connect(dlg.reject)
-
         btn_row.addStretch()
         btn_row.addWidget(btn_cancel)
         btn_row.addWidget(btn_start)
         layout.addLayout(btn_row)
 
-        # Poll for EDL devices using the scan timer
         poll = QTimer(dlg)
-        def _check_edl():
-            edl_count = sum(
-                1 for d in self.devices.values() if d["is_edl"]
+        def _check():
+            n = sum(1 for d in self.devices.values() if d["is_edl"])
+            count_lbl.setText(
+                f"{n} device{'s' if n != 1 else ''} in EDL — ready" if n
+                else "Waiting for EDL devices…"
             )
-            if edl_count:
-                count_lbl.setText(f"{edl_count} device{'s' if edl_count > 1 else ''} in EDL — ready")
-                btn_start.setEnabled(True)
-            else:
-                count_lbl.setText("Waiting for EDL devices…")
-                btn_start.setEnabled(False)
-
-        poll.timeout.connect(_check_edl)
+            btn_start.setEnabled(bool(n))
+        poll.timeout.connect(_check)
         poll.start(SCAN_INTERVAL_MS)
 
         result = dlg.exec()
         poll.stop()
-
         if result == QDialog.DialogCode.Accepted:
             QTimer.singleShot(100, self._start_run)
 
-    # ── Header helpers ─────────────────────────────────────────────────────────
+    # ── Header helpers ────────────────────────────────────────────────────────────
 
     def _update_start_btn(self):
         if self.run_active:
             return
-        has_edl = any(d["is_edl"] for d in self.devices.values())
-        self.btn_start.setEnabled(has_edl)
+        self.btn_start.setEnabled(
+            any(d["is_edl"] for d in self.devices.values())
+        )
 
     def _update_summary(self):
         if not self.run_serials:
@@ -677,7 +685,7 @@ class FactoryStation(QMainWindow):
             dev = self.devices.get(serial)
             if dev and dev["state"] in counts:
                 counts[dev["state"]] += 1
-        total = len(self.run_serials)
+        total   = len(self.run_serials)
         done    = counts[S_DONE]
         failed  = counts[S_FAILED] + counts[S_TIMEOUT]
         skipped = counts[S_SKIPPED]
@@ -687,9 +695,8 @@ class FactoryStation(QMainWindow):
 
 
 if __name__ == "__main__":
-    from PyQt6.QtWidgets import QApplication
     import sys
-
+    from PyQt6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     window = FactoryStation()
     window.show()

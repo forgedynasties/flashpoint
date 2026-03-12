@@ -74,6 +74,24 @@ class DeviceScanner:
         except:
             pass
         return usb_to_tid
+
+    @staticmethod
+    def get_adb_serial_map():
+        """Map device serials to ADB transport IDs.
+
+        Parses the first column of 'adb devices -l' as the serial, which matches
+        the QDL serial reported by qdl list. More reliable than USB path matching.
+        """
+        serial_to_tid = {}
+        try:
+            adb_out = subprocess.check_output(["adb", "devices", "-l"]).decode()
+            for line in adb_out.splitlines():
+                m = re.match(r'^(\S+)\s+\w+.*transport_id:(\d+)', line)
+                if m:
+                    serial_to_tid[m.group(1)] = m.group(2)
+        except:
+            pass
+        return serial_to_tid
     
     @staticmethod
     def get_build_id(transport_id):
