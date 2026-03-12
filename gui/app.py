@@ -1,19 +1,19 @@
 """Main application window for the flash station."""
 import os
-import re
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
-    QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QProgressBar,
-    QCheckBox, QHeaderView, QSizePolicy, QDialog, QSpacerItem,
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
+    QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem,
+    QCheckBox, QHeaderView, QSizePolicy,
 )
-from PyQt6.QtCore import QTimer, Qt, QProcess, QRect
+from PyQt6.QtCore import QTimer, Qt, QRect
 from PyQt6.QtGui import QColor, QPen, QBrush
 
-from config import SCAN_INTERVAL_MS, FW_PATH_ENV
-from styles import Styles, Colors, STATUS_COLORS
-from device import Device
-from scanner import scan_all
-from qdl_wrapper import FlashManager, RebootManager
+from config import FW_PATH_ENV
+from gui.styles import Styles, Colors, STATUS_COLORS
+from core.device import Device
+from core.scanner import scan_all
+from core.qdl_wrapper import FlashManager
+from gui.base_station import BaseFlashStation
 
 # Column indices
 COL_CHECK    = 0
@@ -63,7 +63,7 @@ class CheckboxHeader(QHeaderView):
                 painter.drawLine(x + 5, y + 9, x + 10, y + 3)
 
 
-class FlashStation(QMainWindow):
+class FlashStation(BaseFlashStation):
     """Main application window for managing device flashing."""
 
     def __init__(self):
@@ -177,9 +177,10 @@ class FlashStation(QMainWindow):
         self.main_layout.addWidget(self.table)
 
     def setup_scanning(self):
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.scan)
-        self.timer.start(SCAN_INTERVAL_MS)
+        self._setup_scanning()
+
+    def _scan(self):
+        self.scan()
 
     # ------------------------------------------------------------------
     # Firmware helpers
@@ -264,20 +265,10 @@ class FlashStation(QMainWindow):
         self.table.setItem(row, COL_USB,    usb_item)
         self.table.setItem(row, COL_BUILD,  build_id_item)
 
-        progress = QProgressBar()
-        progress.setValue(0)
-        progress.setTextVisible(True)
-        progress.setStyleSheet(Styles.get_progress_bar_style())
-        pw = QWidget()
-        pw.setStyleSheet("background: transparent;")
-        pl = QVBoxLayout(pw)
-        pl.setContentsMargins(6, 0, 6, 0)
-        pl.addWidget(progress)
+        pw, progress = self._make_progress_widget()
         self.table.setCellWidget(row, COL_PROGRESS, pw)
 
-        log_box = QLabel()
-        log_box.setStyleSheet(Styles.get_log_box_style())
-        log_box.setContentsMargins(6, 0, 6, 0)
+        log_box = self._make_log_label()
         self.table.setCellWidget(row, COL_LOGS, log_box)
 
         action_widget = QWidget()
@@ -390,7 +381,8 @@ class FlashStation(QMainWindow):
         all_checked = bool(edl) and all(self._rows[s]["chk"].isChecked() for s in edl)
         selecting = not all_checked
         for s, r in self._rows.items():
-            r["chk"].setChecked(selecting and self.devices.get(s, Device(s, "")).is_edl)
+            dev = self.devices.get(s)
+            r["chk"].setChecked(selecting and dev is not None and dev.is_edl)
         self._update_selection_label()
         if selecting:
             non_edl_adb = [
@@ -403,7 +395,8 @@ class FlashStation(QMainWindow):
     def _on_checkbox_clicked(self, serial: str, checked: bool):
         if serial not in self._rows:
             return
-        if checked and not self.devices.get(serial, Device(serial, "")).is_edl:
+        dev = self.devices.get(serial)
+        if checked and (dev is None or not dev.is_edl):
             self._rows[serial]["chk"].setChecked(False)
             self._show_edl_warning(serial)
             return
@@ -565,21 +558,7 @@ class FlashStation(QMainWindow):
         row["log_box"].setText("")
         self._update_ui_lock()
 
-        process = QProcess()
-        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        row["process"] = process
-
-        def handle_output():
-            data = process.readAllStandardOutput().data().decode()
-            for line in data.splitlines():
-                stripped = line.strip()
-                if stripped:
-                    row["log_box"].setText(stripped)
-                    m = re.search(r"(\d+\.\d+)%", line)
-                    if m:
-                        row["progress"].setValue(min(int(float(m.group(1))), 100))
-
-        def handle_finished(exit_code):
+        def on_done(exit_code: int) -> None:
             row["is_flashing"] = False
             row["process"] = None
             row["btn_flash"].setEnabled(True)
@@ -595,10 +574,12 @@ class FlashStation(QMainWindow):
                 row["progress"].setStyleSheet(Styles.get_progress_bar_style(Colors.ERROR))
             self._update_ui_lock()
 
-        process.readyReadStandardOutput.connect(handle_output)
-        process.finished.connect(lambda code, _: handle_finished(code))
-        process.setWorkingDirectory(cwd)
-        process.start(args[0], args[1:])
+        row["process"] = self._launch_flash_process(
+            args, cwd,
+            on_log=row["log_box"].setText,
+            on_progress=row["progress"].setValue,
+            on_done=on_done,
+        )
 
 
 if __name__ == "__main__":

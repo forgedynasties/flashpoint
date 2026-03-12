@@ -51,7 +51,6 @@ class FlashManager:
         Returns:
             list: Command arguments for subprocess
         """
-        firmware_dir = os.path.dirname(raw)
         return [
             "sudo",
             QDL_BIN,
@@ -72,17 +71,3 @@ class FlashManager:
         return os.path.dirname(raw_path)
 
 
-class RebootManager:
-    """Handles device rebooting operations."""
-    
-    @staticmethod
-    def reboot_to_edl(transport_id):
-        """Reboot device to EDL mode via ADB.
-        
-        Args:
-            transport_id: ADB transport ID
-        """
-        try:
-            subprocess.Popen(["adb", "-t", transport_id, "reboot", "edl"])
-        except:
-            pass

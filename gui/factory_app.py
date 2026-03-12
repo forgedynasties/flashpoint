@@ -5,15 +5,15 @@ All device logic lives in pipeline.py / device.py; this file only handles
 Qt widgets, QProcess, and QTimer.
 """
 import os
-import re
 from datetime import datetime
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QTableWidget, QTableWidgetItem, QProgressBar,
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QDialog, QTextEdit, QApplication,
 )
 from PyQt6.QtCore import QTimer, Qt, QProcess
 from PyQt6.QtGui import QColor
+from gui.base_station import BaseFlashStation
 
 from config import (
     SCAN_INTERVAL_MS,
@@ -21,10 +21,10 @@ from config import (
     BOOT_TIMEOUT_SEC_ENV, DEFAULT_BOOT_TIMEOUT_SEC,
     FACTORY_REPORTS_DIR_ENV, DEFAULT_REPORTS_DIR,
 )
-from styles import Styles, Colors
-from device import Device
-from scanner import scan_edl, scan_adb
-from pipeline import (
+from gui.styles import Styles, Colors
+from core.device import Device
+from core.scanner import scan_edl, scan_adb
+from core.pipeline import (
     FactoryPipeline,
     S_WAITING, S_SKIPPED, S_FLASH1, S_BOOTING,
     S_REBOOTING_EDL, S_FLASH3, S_DONE, S_FAILED, S_TIMEOUT,
@@ -65,7 +65,7 @@ COL_LOG      = 4
 COL_COUNT    = 5
 
 
-class FactoryStation(QMainWindow):
+class FactoryStation(BaseFlashStation):
     """Factory assembly flash station — serial-keyed 3-stage pipeline."""
 
     def __init__(self):
@@ -186,9 +186,7 @@ class FactoryStation(QMainWindow):
         parent_layout.addWidget(self.table)
 
     def _setup_scanning(self):
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._scan)
-        self.timer.start(SCAN_INTERVAL_MS)
+        super()._setup_scanning()
 
     # ── Scanning ──────────────────────────────────────────────────────────────
 
@@ -247,21 +245,10 @@ class FactoryStation(QMainWindow):
         self.table.setItem(row, COL_STAGE,  stage_item)
         self.table.setItem(row, COL_STATUS, status_item)
 
-        progress = QProgressBar()
-        progress.setRange(0, 100)
-        progress.setValue(0)
-        progress.setTextVisible(True)
-        progress.setStyleSheet(Styles.get_progress_bar_style())
-        pw = QWidget()
-        pw.setStyleSheet("background: transparent;")
-        pl = QHBoxLayout(pw)
-        pl.setContentsMargins(6, 6, 6, 6)
-        pl.addWidget(progress)
+        pw, progress = self._make_progress_widget()
         self.table.setCellWidget(row, COL_PROGRESS, pw)
 
-        log_lbl = QLabel()
-        log_lbl.setStyleSheet(Styles.get_log_box_style())
-        log_lbl.setContentsMargins(6, 0, 6, 0)
+        log_lbl = self._make_log_label()
         self.table.setCellWidget(row, COL_LOG, log_lbl)
 
         self._widgets[serial] = {
@@ -402,34 +389,23 @@ class FactoryStation(QMainWindow):
             self._on_log(serial, str(e))
             return
 
-        process = QProcess()
-        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        procs["process"] = process
-
         w = self._widgets.get(serial, {})
 
-        def on_output():
-            data = process.readAllStandardOutput().data().decode()
-            for line in data.splitlines():
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                self._on_log(serial, stripped)
-                m = re.search(r"(\d+\.\d+)%", stripped)
-                if m:
-                    self._on_progress(serial, min(int(float(m.group(1))), 100))
-
-        def on_finished(code, _status):
+        def on_done(code: int) -> None:
             procs["process"] = None
+            if self._pipeline is None:
+                return
             if code == 0 and w:
                 w["progress"].setValue(100)
             self._pipeline.flash_done(serial, stage, code)
             self._drain_pending_actions()
 
-        process.readyReadStandardOutput.connect(on_output)
-        process.finished.connect(on_finished)
-        process.setWorkingDirectory(cwd)
-        process.start(args[0], args[1:])
+        procs["process"] = self._launch_flash_process(
+            args, cwd,
+            on_log=lambda text: self._on_log(serial, text),
+            on_progress=lambda pct: self._on_progress(serial, pct),
+            on_done=on_done,
+        )
 
     # ── Build ID check ────────────────────────────────────────────────────────
 
@@ -444,21 +420,18 @@ class FactoryStation(QMainWindow):
         if not device or not device.transport_id:
             return
 
-        proc = QProcess()
-        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        procs["build_id_proc"] = proc
         self._build_id_in_flight.add(serial)
 
-        def on_finished(code, _status):
+        def on_result(output: str) -> None:
             self._build_id_in_flight.discard(serial)
             procs["build_id_proc"] = None
-            if serial not in self._devices:
+            if self._pipeline is None or serial not in self._devices:
                 return
-            output = proc.readAllStandardOutput().data().decode().strip()
             self._pipeline.build_id_result(serial, output)
 
-        proc.finished.connect(on_finished)
-        proc.start("adb", ["-t", device.transport_id, "shell", "getprop", "ro.build.id"])
+        procs["build_id_proc"] = self._launch_build_id_check(
+            device.transport_id, on_result
+        )
 
     # ── Session complete ───────────────────────────────────────────────────────
 

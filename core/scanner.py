@@ -10,7 +10,7 @@ import subprocess
 from typing import Optional
 
 from config import USB_PIDs
-from device import Device
+from core.device import Device
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -101,18 +101,15 @@ def scan_all() -> dict[str, Device]:
     # EDL devices
     devices.update(scan_edl())
 
-    # Build two ADB lookup tables: serial→tid and usb_path→tid
-    serial_to_tid: dict[str, str] = {}
+    # ADB lookup tables: serial→tid (from scan_adb) and usb_path→tid
+    serial_to_tid: dict[str, str] = scan_adb()
     path_to_tid: dict[str, str] = {}
     try:
         out = subprocess.check_output(["adb", "devices", "-l"]).decode()
         for line in out.splitlines():
-            m = re.match(r"^(\S+)\s+\w+.*transport_id:(\d+)", line)
+            m = re.search(r"usb:(\S+).*transport_id:(\d+)", line)
             if m:
-                serial_to_tid[m.group(1)] = m.group(2)
-            m2 = re.search(r"usb:(\S+).*transport_id:(\d+)", line)
-            if m2:
-                path_to_tid[m2.group(1)] = m2.group(2)
+                path_to_tid[m.group(1)] = m.group(2)
     except Exception:
         pass
 

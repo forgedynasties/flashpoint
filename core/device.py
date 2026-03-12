@@ -77,7 +77,7 @@ class Device:
         Raises:
             FileNotFoundError: if firmware files are missing/incomplete.
         """
-        from qdl_wrapper import FlashManager
+        from core.qdl_wrapper import FlashManager
 
         prog, raw, patch = FlashManager.find_firmware_files(fw_path)
         if not (prog and raw and patch):

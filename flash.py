@@ -6,7 +6,7 @@ A modular PyQt6 application for flashing Qualcomm devices in EDL or debug mode.
 import sys
 from PyQt6.QtWidgets import QApplication
 
-from app import FlashStation
+from gui.app import FlashStation
 
 
 def main():

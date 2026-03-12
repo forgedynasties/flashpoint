@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 
-from scanner import scan_all
+from core.scanner import scan_all
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

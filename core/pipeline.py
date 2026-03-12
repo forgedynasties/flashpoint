@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from device import Device
+from core.device import Device
 
 # ── Pipeline states ───────────────────────────────────────────────────────────
 
