@@ -1,9 +1,8 @@
 """Factory Assembly Flash Station — serial-keyed 3-stage pipeline.
 
-Devices are keyed by serial throughout (matching app.py). ADB transport IDs
-are looked up by serial from 'adb devices -l' rather than by USB path, which
-avoids path-matching failures that caused BOOTING timeouts when the sysfs
-path and ADB-reported path didn't agree.
+The GUI drives a FactoryPipeline (pure state machine) via a QTimer.
+All device logic lives in pipeline.py / device.py; this file only handles
+Qt widgets, QProcess, and QTimer.
 """
 import os
 import re
@@ -20,25 +19,19 @@ from config import (
     SCAN_INTERVAL_MS,
     FACTORY_FW_PATH_ENV, PROD_DEBUG_FW_PATH_ENV,
     BOOT_TIMEOUT_SEC_ENV, DEFAULT_BOOT_TIMEOUT_SEC,
-    EXPECTED_BUILD_ID,
     FACTORY_REPORTS_DIR_ENV, DEFAULT_REPORTS_DIR,
 )
 from styles import Styles, Colors
-from utils_device_manager import DeviceScanner
-from utils_flash_manager import FlashManager, RebootManager
+from device import Device
+from scanner import scan_edl, scan_adb
+from pipeline import (
+    FactoryPipeline,
+    S_WAITING, S_SKIPPED, S_FLASH1, S_BOOTING,
+    S_REBOOTING_EDL, S_FLASH3, S_DONE, S_FAILED, S_TIMEOUT,
+    TERMINAL,
+)
 
-# ── Pipeline states ─────────────────────────────────────────────────────────────
-S_WAITING       = "WAITING"
-S_SKIPPED       = "SKIPPED"
-S_FLASH1        = "FLASH 1/3"
-S_BOOTING       = "BOOTING"
-S_REBOOTING_EDL = "TO EDL"
-S_FLASH3        = "FLASH 3/3"
-S_DONE          = "DONE"
-S_FAILED        = "FAILED"
-S_TIMEOUT       = "TIMEOUT"
-
-TERMINAL = {S_DONE, S_FAILED, S_TIMEOUT, S_SKIPPED}
+# ── UI-only mappings ──────────────────────────────────────────────────────────
 
 STATE_COLORS = {
     S_WAITING:       Colors.TEXT_SECONDARY,
@@ -87,16 +80,24 @@ class FactoryStation(QMainWindow):
             BOOT_TIMEOUT_SEC_ENV, DEFAULT_BOOT_TIMEOUT_SEC)) * 1000
         self.reports_dir = os.getenv(FACTORY_REPORTS_DIR_ENV, DEFAULT_REPORTS_DIR)
 
-        # Keyed by device serial
-        self.devices     = {}
+        # {serial: Device} — populated by scanner before run starts
+        self._devices: dict[str, Device] = {}
+        # {serial: dict}  — Qt widget refs (row, stage_item, status_item, progress, log_lbl)
+        self._widgets: dict[str, dict] = {}
+        # {serial: dict}  — async process handles (process, build_id_proc)
+        self._procs: dict[str, dict] = {}
+        # Set of serials whose build_id QProcess is currently in flight
+        self._build_id_in_flight: set[str] = set()
+
+        self._pipeline: FactoryPipeline | None = None
         self.run_active  = False
-        self.run_serials = set()
-        self.cycle_start = None
+        self.run_serials: set[str] = set()
+        self.cycle_start: datetime | None = None
 
         self._setup_ui()
         self._setup_scanning()
 
-    # ── UI setup ────────────────────────────────────────────────────────────────
+    # ── UI setup ─────────────────────────────────────────────────────────────
 
     def _setup_ui(self):
         root = QWidget()
@@ -189,45 +190,44 @@ class FactoryStation(QMainWindow):
         self.timer.timeout.connect(self._scan)
         self.timer.start(SCAN_INTERVAL_MS)
 
-    # ── Scanning ────────────────────────────────────────────────────────────────
+    # ── Scanning ──────────────────────────────────────────────────────────────
 
     def _scan(self):
-        edl_devices   = DeviceScanner.get_edl_devices()    # {serial: path}
-        adb_by_serial = DeviceScanner.get_adb_serial_map() # {serial: tid}
+        edl_devices = scan_edl()   # {serial: Device}
+        adb_map     = scan_adb()   # {serial: tid}
 
-        # Register new EDL devices not yet in the table
-        for serial in edl_devices:
-            if serial not in self.devices:
-                self._add_row(serial)
-
-        # Advance state machine for each tracked device
-        for serial in list(self.devices.keys()):
-            dev   = self.devices[serial]
-            state = dev["state"]
-
-            if state == S_WAITING:
-                if serial in edl_devices:
-                    dev["is_edl"] = True
-                else:
-                    # Unplugged before run started
+        if not self.run_active:
+            # Pre-run: track EDL devices, allow row addition/removal
+            for serial, device in edl_devices.items():
+                if serial not in self._widgets:
+                    self._devices[serial] = device
+                    self._add_row(serial)
+            for serial in list(self._widgets.keys()):
+                if serial not in edl_devices:
                     self._remove_row(serial)
-
-            elif state == S_BOOTING:
-                # Device serial appears in ADB → it has booted
-                if serial in adb_by_serial:
-                    self._check_build_id(serial, adb_by_serial[serial])
-
-            elif state == S_REBOOTING_EDL:
-                # Waiting for device to come back as EDL
-                if serial in edl_devices:
-                    self._start_flash(serial, stage=3)
+        else:
+            # During run: update transport IDs for booted devices
+            for serial, tid in adb_map.items():
+                if serial in self._devices:
+                    self._devices[serial].transport_id = tid
+            # Advance pipeline and drain queued actions
+            self._pipeline.tick(set(edl_devices.keys()), adb_map)
+            self._drain_pending_actions()
 
         self._update_start_btn()
         self._update_summary()
 
-    # ── Row management ──────────────────────────────────────────────────────────
+    def _drain_pending_actions(self):
+        if not self._pipeline:
+            return
+        for serial, stage in self._pipeline.drain_flash_requests():
+            self._start_flash_process(serial, stage)
+        for serial in self._pipeline.drain_build_id_requests():
+            self._start_build_id_check(serial)
 
-    def _add_row(self, serial):
+    # ── Row management ────────────────────────────────────────────────────────
+
+    def _add_row(self, serial: str):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
@@ -243,9 +243,9 @@ class FactoryStation(QMainWindow):
         status_item = item(S_WAITING, center)
         status_item.setForeground(QColor(STATE_COLORS[S_WAITING]))
 
-        self.table.setItem(row, COL_SERIAL,  serial_item)
-        self.table.setItem(row, COL_STAGE,   stage_item)
-        self.table.setItem(row, COL_STATUS,  status_item)
+        self.table.setItem(row, COL_SERIAL, serial_item)
+        self.table.setItem(row, COL_STAGE,  stage_item)
+        self.table.setItem(row, COL_STATUS, status_item)
 
         progress = QProgressBar()
         progress.setRange(0, 100)
@@ -264,132 +264,149 @@ class FactoryStation(QMainWindow):
         log_lbl.setContentsMargins(6, 0, 6, 0)
         self.table.setCellWidget(row, COL_LOG, log_lbl)
 
-        self.devices[serial] = {
-            "row":           row,
-            "state":         S_WAITING,
-            "fail_reason":   "",
-            "is_edl":        True,
-            "stage_item":    stage_item,
-            "status_item":   status_item,
-            "progress":      progress,
-            "log_lbl":       log_lbl,
-            "process":       None,
-            "boot_timer":    None,
-            "build_id_proc": None,
+        self._widgets[serial] = {
+            "row":         row,
+            "stage_item":  stage_item,
+            "status_item": status_item,
+            "progress":    progress,
+            "log_lbl":     log_lbl,
         }
+        self._procs[serial] = {"process": None, "build_id_proc": None}
 
-    def _remove_row(self, serial):
-        dev = self.devices.pop(serial)
-        self.table.removeRow(dev["row"])
-        for d in self.devices.values():
-            if d["row"] > dev["row"]:
+    def _remove_row(self, serial: str):
+        w = self._widgets.pop(serial, None)
+        if not w:
+            return
+        self._devices.pop(serial, None)
+        self._procs.pop(serial, None)
+        self.table.removeRow(w["row"])
+        for d in self._widgets.values():
+            if d["row"] > w["row"]:
                 d["row"] -= 1
 
-    # ── State machine ────────────────────────────────────────────────────────────
+    # ── State updates (called via pipeline callbacks) ─────────────────────────
 
-    def _set_state(self, serial, state, fail_reason=""):
-        dev = self.devices[serial]
-        dev["state"]       = state
-        dev["fail_reason"] = fail_reason
-
-        dev["status_item"].setText(state)
-        dev["status_item"].setForeground(
+    def _on_state_change(self, serial: str, state: str, reason: str):
+        w = self._widgets.get(serial)
+        if not w:
+            return
+        w["status_item"].setText(state)
+        w["status_item"].setForeground(
             QColor(STATE_COLORS.get(state, Colors.TEXT_SECONDARY))
         )
-        dev["stage_item"].setText(STAGE_LABEL.get(state, "—"))
+        w["stage_item"].setText(STAGE_LABEL.get(state, "—"))
 
+        progress = w["progress"]
         if state in (S_BOOTING, S_REBOOTING_EDL):
-            dev["progress"].setRange(0, 0)
+            progress.setRange(0, 0)
         elif state == S_DONE:
-            dev["progress"].setRange(0, 100)
-            dev["progress"].setValue(100)
-            dev["progress"].setStyleSheet(Styles.get_progress_bar_style(Colors.SUCCESS))
+            progress.setRange(0, 100)
+            progress.setValue(100)
+            progress.setStyleSheet(Styles.get_progress_bar_style(Colors.SUCCESS))
         elif state in (S_FAILED, S_TIMEOUT):
-            dev["progress"].setRange(0, 100)
-            dev["progress"].setValue(0)
-            dev["progress"].setStyleSheet(Styles.get_progress_bar_style(Colors.ERROR))
-            if fail_reason:
-                dev["log_lbl"].setText(fail_reason)
+            progress.setRange(0, 100)
+            progress.setValue(0)
+            progress.setStyleSheet(Styles.get_progress_bar_style(Colors.ERROR))
+            if reason:
+                w["log_lbl"].setText(reason)
         elif state in (S_FLASH1, S_FLASH3):
-            dev["progress"].setRange(0, 100)
-            dev["progress"].setValue(0)
-            dev["progress"].setStyleSheet(Styles.get_progress_bar_style(Colors.WARNING))
+            progress.setRange(0, 100)
+            progress.setValue(0)
+            progress.setStyleSheet(Styles.get_progress_bar_style(Colors.WARNING))
         else:
-            dev["progress"].setRange(0, 100)
-            dev["progress"].setValue(0)
-            dev["progress"].setStyleSheet(Styles.get_progress_bar_style())
+            progress.setRange(0, 100)
+            progress.setValue(0)
+            progress.setStyleSheet(Styles.get_progress_bar_style())
 
-    def _set_failed(self, serial, reason):
-        self._set_state(serial, S_FAILED, reason)
-        self._check_complete()
+        if state in TERMINAL:
+            self._check_complete()
 
-    # ── Run control ──────────────────────────────────────────────────────────────
+    def _on_progress(self, serial: str, pct: int):
+        w = self._widgets.get(serial)
+        if w:
+            w["progress"].setValue(pct)
+
+    def _on_log(self, serial: str, text: str):
+        w = self._widgets.get(serial)
+        if w:
+            w["log_lbl"].setText(text)
+
+    # ── Run control ───────────────────────────────────────────────────────────
 
     def _start_run(self):
         if self.run_active:
             return
+
+        edl_devices = {s: d for s, d in self._devices.items() if d.is_edl}
+        if not edl_devices:
+            return
+
         self.run_active  = True
-        self.run_serials = set(self.devices.keys())
+        self.run_serials = set(edl_devices.keys())
         self.cycle_start = datetime.now()
 
         self.btn_start.setEnabled(False)
         self.btn_start.setText("Running...")
         self.btn_stop.setEnabled(True)
 
-        for serial in list(self.run_serials):
-            dev = self.devices[serial]
-            if dev["is_edl"]:
-                self._start_flash(serial, stage=1)
-            else:
-                self._set_state(serial, S_SKIPPED)
-                dev["log_lbl"].setText("Not in EDL at start")
-
+        self._pipeline = FactoryPipeline(
+            devices=list(edl_devices.values()),
+            factory_fw=self.factory_fw,
+            prod_fw=self.prod_fw,
+            boot_timeout_sec=self.boot_timeout_ms // 1000,
+        )
+        self._pipeline.on_state_change = self._on_state_change
+        self._pipeline.on_progress     = self._on_progress
+        self._pipeline.on_log          = self._on_log
+        self._pipeline.start()
+        self._drain_pending_actions()
         self._check_complete()
 
     def _stop_run(self):
-        for serial, dev in self.devices.items():
-            self._cancel_boot_timer(serial)
-            self._cancel_build_id_check(serial)
-            proc = dev.get("process")
-            if proc and proc.state() != QProcess.ProcessState.NotRunning:
-                proc.kill()
-                dev["process"] = None
-            if dev["state"] not in TERMINAL:
-                self._set_state(serial, S_FAILED, "Stopped by operator")
+        # Kill any in-flight processes
+        for serial, procs in self._procs.items():
+            for key in ("process", "build_id_proc"):
+                p = procs.get(key)
+                if p and p.state() != QProcess.ProcessState.NotRunning:
+                    p.kill()
+            procs["process"] = None
+            procs["build_id_proc"] = None
+        self._build_id_in_flight.clear()
+
+        # Mark unfinished jobs as failed
+        if self._pipeline:
+            for serial in self.run_serials:
+                if self._pipeline.state_of(serial) not in TERMINAL:
+                    # Force state change via callback (pipeline is being abandoned)
+                    self._on_state_change(serial, S_FAILED, "Stopped by operator")
 
         self.run_active = False
         self.run_serials.clear()
+        self._pipeline = None
         self.btn_stop.setEnabled(False)
         self.btn_start.setEnabled(True)
         self.btn_start.setText("Start")
         self._update_summary()
 
-    # ── Flash ────────────────────────────────────────────────────────────────────
+    # ── Flash process ─────────────────────────────────────────────────────────
 
-    def _start_flash(self, serial, stage):
-        dev = self.devices[serial]
+    def _start_flash_process(self, serial: str, stage: int):
+        procs = self._procs.get(serial)
+        if not procs or procs.get("process"):
+            return  # guard re-entry
 
-        # Guard against re-entry (scan calls this for stage 3 every cycle)
-        if stage == 1 and dev["state"] == S_FLASH1:
+        try:
+            args, cwd = self._pipeline.flash_command_for(serial, stage)
+        except FileNotFoundError as e:
+            self._pipeline.flash_done(serial, stage, 1)
+            self._on_log(serial, str(e))
             return
-        if stage == 3 and dev["state"] == S_FLASH3:
-            return
-
-        fw_path = self.factory_fw if stage == 1 else self.prod_fw
-        state   = S_FLASH1        if stage == 1 else S_FLASH3
-
-        prog, raw, patch = FlashManager.find_firmware_files(fw_path)
-        if not (prog and raw and patch):
-            self._set_failed(serial, f"Stage {stage} firmware not found in: {fw_path}")
-            return
-
-        self._set_state(serial, state)
-        dev["log_lbl"].setText("")
-        dev["is_edl"] = False
 
         process = QProcess()
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        dev["process"] = process
+        procs["process"] = process
+
+        w = self._widgets.get(serial, {})
 
         def on_output():
             data = process.readAllStandardOutput().data().decode()
@@ -397,104 +414,58 @@ class FactoryStation(QMainWindow):
                 stripped = line.strip()
                 if not stripped:
                     continue
-                dev["log_lbl"].setText(stripped)
+                self._on_log(serial, stripped)
                 m = re.search(r"(\d+\.\d+)%", stripped)
                 if m:
-                    dev["progress"].setValue(min(int(float(m.group(1))), 100))
+                    self._on_progress(serial, min(int(float(m.group(1))), 100))
 
         def on_finished(code, _status):
-            dev["process"] = None
-            if code == 0:
-                dev["progress"].setValue(100)
-                if stage == 1:
-                    self._set_state(serial, S_BOOTING)
-                    dev["log_lbl"].setText("Waiting for device to boot…")
-                    self._start_boot_timer(serial)
-                else:
-                    self._set_state(serial, S_DONE)
-                    dev["log_lbl"].setText("Complete")
-            else:
-                self._set_failed(serial, f"Stage {stage} flash failed (exit {code})")
-            self._check_complete()
+            procs["process"] = None
+            if code == 0 and w:
+                w["progress"].setValue(100)
+            self._pipeline.flash_done(serial, stage, code)
+            self._drain_pending_actions()
 
         process.readyReadStandardOutput.connect(on_output)
         process.finished.connect(on_finished)
-        args = FlashManager.build_flash_command(serial, prog, raw, patch)
-        process.setWorkingDirectory(FlashManager.get_working_directory(raw))
+        process.setWorkingDirectory(cwd)
         process.start(args[0], args[1:])
 
-    # ── Build ID check (non-blocking QProcess) ───────────────────────────────────
+    # ── Build ID check ────────────────────────────────────────────────────────
 
-    def _check_build_id(self, serial, tid):
-        """Start an async adb getprop. No-ops if one is already in flight.
-        Retries each scan cycle until ADB responds with output."""
-        dev = self.devices.get(serial)
-        if not dev or dev.get("build_id_proc"):
+    def _start_build_id_check(self, serial: str):
+        if serial in self._build_id_in_flight:
+            return
+        procs = self._procs.get(serial)
+        if not procs:
+            return
+
+        device = self._devices.get(serial)
+        if not device or not device.transport_id:
             return
 
         proc = QProcess()
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        dev["build_id_proc"] = proc
+        procs["build_id_proc"] = proc
+        self._build_id_in_flight.add(serial)
 
         def on_finished(code, _status):
-            if serial not in self.devices:
-                return
-            dev["build_id_proc"] = None
-            if dev["state"] != S_BOOTING:
+            self._build_id_in_flight.discard(serial)
+            procs["build_id_proc"] = None
+            if serial not in self._devices:
                 return
             output = proc.readAllStandardOutput().data().decode().strip()
-            if not output:
-                return   # ADB not ready yet — retry next scan cycle
-            self._cancel_boot_timer(serial)
-            if output == EXPECTED_BUILD_ID:
-                self._set_state(serial, S_REBOOTING_EDL)
-                dev["log_lbl"].setText("Rebooting to EDL…")
-                RebootManager.reboot_to_edl(tid)
-            else:
-                self._set_failed(serial, f"Build ID mismatch: {output!r}")
+            self._pipeline.build_id_result(serial, output)
 
         proc.finished.connect(on_finished)
-        proc.start("adb", ["-t", tid, "shell", "getprop", "ro.build.id"])
+        proc.start("adb", ["-t", device.transport_id, "shell", "getprop", "ro.build.id"])
 
-    def _cancel_build_id_check(self, serial):
-        dev = self.devices.get(serial, {})
-        p = dev.get("build_id_proc")
-        if p and p.state() != QProcess.ProcessState.NotRunning:
-            p.kill()
-        dev["build_id_proc"] = None
-
-    # ── Boot timer ───────────────────────────────────────────────────────────────
-
-    def _start_boot_timer(self, serial):
-        timer = QTimer()
-        timer.setSingleShot(True)
-        timer.timeout.connect(lambda: self._on_boot_timeout(serial))
-        timer.start(self.boot_timeout_ms)
-        self.devices[serial]["boot_timer"] = timer
-
-    def _cancel_boot_timer(self, serial):
-        dev = self.devices.get(serial, {})
-        t = dev.get("boot_timer")
-        if t:
-            t.stop()
-            dev["boot_timer"] = None
-
-    def _on_boot_timeout(self, serial):
-        if serial in self.devices and self.devices[serial]["state"] == S_BOOTING:
-            self._set_state(serial, S_TIMEOUT,
-                            f"No boot within {self.boot_timeout_ms // 1000}s")
-            self._check_complete()
-
-    # ── Session complete ──────────────────────────────────────────────────────────
+    # ── Session complete ───────────────────────────────────────────────────────
 
     def _check_complete(self):
-        if not self.run_active:
+        if not self.run_active or not self._pipeline:
             return
-        pending = [
-            s for s in self.run_serials
-            if s in self.devices and self.devices[s]["state"] not in TERMINAL
-        ]
-        if not pending:
+        if self._pipeline.is_complete:
             self.run_active = False
             self.btn_stop.setEnabled(False)
             self.btn_start.setText("Start")
@@ -502,7 +473,7 @@ class FactoryStation(QMainWindow):
             self._update_summary()
             QTimer.singleShot(400, self._show_report)
 
-    # ── Report dialog ─────────────────────────────────────────────────────────────
+    # ── Report dialog ──────────────────────────────────────────────────────────
 
     def _show_report(self):
         now     = datetime.now()
@@ -512,14 +483,11 @@ class FactoryStation(QMainWindow):
         dur     = f"{total // 60}m {total % 60}s"
         ts      = started.strftime("%Y-%m-%d  %H:%M:%S")
 
-        counts = {S_DONE: 0, S_FAILED: 0, S_TIMEOUT: 0, S_SKIPPED: 0}
-        lines  = []
+        results = self._pipeline.results() if self._pipeline else {}
+        counts  = {S_DONE: 0, S_FAILED: 0, S_TIMEOUT: 0, S_SKIPPED: 0}
+        lines   = []
         for serial in sorted(self.run_serials):
-            dev = self.devices.get(serial)
-            if not dev:
-                continue
-            state  = dev["state"]
-            reason = dev["fail_reason"]
+            state, reason = results.get(serial, (S_FAILED, ""))
             if state in counts:
                 counts[state] += 1
             suffix = f"  —  {reason}" if reason else ""
@@ -587,7 +555,7 @@ class FactoryStation(QMainWindow):
         dlg.finished.connect(self._auto_new_cycle)
         dlg.exec()
 
-    def _save_report(self, text, started):
+    def _save_report(self, text: str, started: datetime):
         try:
             os.makedirs(self.reports_dir, exist_ok=True)
             fname = f"cycle_{started.strftime('%Y%m%d_%H%M%S')}.txt"
@@ -597,10 +565,13 @@ class FactoryStation(QMainWindow):
             print(f"[factory] could not save report: {e}")
 
     def _new_cycle(self):
-        for serial in list(self.devices.keys()):
-            if self.devices[serial]["state"] in TERMINAL:
+        for serial in list(self._widgets.keys()):
+            if self._pipeline and self._pipeline.state_of(serial) in TERMINAL:
+                self._remove_row(serial)
+            elif not self._pipeline:
                 self._remove_row(serial)
         self.run_serials.clear()
+        self._pipeline = None
         self._update_summary()
         self._update_start_btn()
 
@@ -653,7 +624,7 @@ class FactoryStation(QMainWindow):
 
         poll = QTimer(dlg)
         def _check():
-            n = sum(1 for d in self.devices.values() if d["is_edl"])
+            n = sum(1 for d in self._devices.values() if d.is_edl)
             count_lbl.setText(
                 f"{n} device{'s' if n != 1 else ''} in EDL — ready" if n
                 else "Waiting for EDL devices…"
@@ -667,24 +638,24 @@ class FactoryStation(QMainWindow):
         if result == QDialog.DialogCode.Accepted:
             QTimer.singleShot(100, self._start_run)
 
-    # ── Header helpers ────────────────────────────────────────────────────────────
+    # ── Header helpers ─────────────────────────────────────────────────────────
 
     def _update_start_btn(self):
         if self.run_active:
             return
         self.btn_start.setEnabled(
-            any(d["is_edl"] for d in self.devices.values())
+            any(d.is_edl for d in self._devices.values())
         )
 
     def _update_summary(self):
-        if not self.run_serials:
+        if not self.run_serials or not self._pipeline:
             self.lbl_summary.setText("")
             return
-        counts = {s: 0 for s in [S_DONE, S_FAILED, S_TIMEOUT, S_SKIPPED]}
+        counts = {S_DONE: 0, S_FAILED: 0, S_TIMEOUT: 0, S_SKIPPED: 0}
         for serial in self.run_serials:
-            dev = self.devices.get(serial)
-            if dev and dev["state"] in counts:
-                counts[dev["state"]] += 1
+            state = self._pipeline.state_of(serial)
+            if state in counts:
+                counts[state] += 1
         total   = len(self.run_serials)
         done    = counts[S_DONE]
         failed  = counts[S_FAILED] + counts[S_TIMEOUT]
