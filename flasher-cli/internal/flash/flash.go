@@ -58,36 +58,73 @@ func Device(ctx context.Context, serial string, fw *firmware.Files, dryRun bool,
 
 	cmd := exec.CommandContext(ctx, "sudo", args...)
 	cmd.Dir = fw.Dir
-	// Merge stderr into stdout so we capture everything.
-	pipe, err := cmd.StdoutPipe()
+
+	// stdout carries ux_info / ux_log messages (newline-terminated).
+	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		updates <- Update{Serial: serial, Done: true, Err: fmt.Errorf("stdout pipe: %w", err)}
 		return
 	}
-	cmd.Stderr = cmd.Stdout
+	// stderr carries ux_progress lines (carriage-return terminated, no newline)
+	// and ux_err messages (newline-terminated).
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		updates <- Update{Serial: serial, Done: true, Err: fmt.Errorf("stderr pipe: %w", err)}
+		return
+	}
 
 	if err := cmd.Start(); err != nil {
 		updates <- Update{Serial: serial, Done: true, Err: fmt.Errorf("start qdl: %w", err)}
 		return
 	}
 
-	scanner := bufio.NewScanner(pipe)
-	var lastLine string
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line != "" {
-			lastLine = line
-		}
-		u := Update{Serial: serial, LastLine: line}
-		if m := progressRe.FindStringSubmatch(line); m != nil {
-			pct, _ := strconv.ParseFloat(m[1], 64)
-			if pct > 100 {
-				pct = 100
+	// scanCRLF splits on either \r or \n so progress lines (ending in \r)
+	// are delivered immediately instead of waiting for a newline.
+	scanCRLF := func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		for i, b := range data {
+			if b == '\r' || b == '\n' {
+				return i + 1, data[:i], nil
 			}
-			u.Progress = int(pct)
 		}
-		updates <- u
+		if atEOF && len(data) > 0 {
+			return len(data), data, nil
+		}
+		return 0, nil, nil
 	}
+
+	var lastLine string
+	readerDone := make(chan struct{}, 2)
+
+	scanPipe := func(scanner *bufio.Scanner) {
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			lastLine = line
+			u := Update{Serial: serial, LastLine: line}
+			if m := progressRe.FindStringSubmatch(line); m != nil {
+				pct, _ := strconv.ParseFloat(m[1], 64)
+				if pct > 100 {
+					pct = 100
+				}
+				u.Progress = int(pct)
+			}
+			updates <- u
+		}
+		readerDone <- struct{}{}
+	}
+
+	stdoutScanner := bufio.NewScanner(stdoutPipe)
+	stdoutScanner.Split(scanCRLF)
+	stderrScanner := bufio.NewScanner(stderrPipe)
+	stderrScanner.Split(scanCRLF)
+
+	go scanPipe(stdoutScanner)
+	go scanPipe(stderrScanner)
+
+	<-readerDone
+	<-readerDone
 
 	waitErr := cmd.Wait()
 	updates <- Update{
