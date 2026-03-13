@@ -2,7 +2,7 @@
 import os
 
 # Paths and binaries
-QDL_BIN = os.path.expanduser("~/aio/qdl/qdl")
+QDL_BIN = os.path.expanduser(os.getenv("QDL_BIN", "~/aio/qdl/qdl"))
 
 # Device scanning
 SCAN_INTERVAL_MS = 1500

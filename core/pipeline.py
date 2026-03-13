@@ -113,6 +113,10 @@ class FactoryPipeline:
                 if job.boot_deadline and now > job.boot_deadline:
                     self._set_failed(serial, f"No boot within {self.boot_timeout_sec}s")
                     continue
+                # Device fell back to QDL — boot failed (ABL crash / incompatible firmware)
+                if serial in edl_serials:
+                    self._set_failed(serial, "Reverted to QDL after flash — boot failed")
+                    continue
                 # ADB appeared — queue a build_id check (deduplicated)
                 if serial in adb_map and serial not in self._pending_build_checks:
                     self._devices[serial].transport_id = adb_map[serial]

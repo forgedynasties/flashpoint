@@ -47,7 +47,32 @@ sudo udevadm trigger
 
 ---
 
-### 3. Verify Without Sudo
+### 3. Passwordless sudo for QDL
+
+The app runs `qdl` via `sudo` and requires a NOPASSWD rule so it never prompts
+for a password mid-flash. Create the sudoers drop-in:
+
+```bash
+sudo visudo -f /etc/sudoers.d/qdl
+```
+
+Add this line (replace the username if needed):
+
+```
+flasher02 ALL=(ALL) NOPASSWD: /home/flasher02/aio/qdl/qdl
+```
+
+Verify it works without a prompt:
+
+```bash
+sudo -n /home/flasher02/aio/qdl/qdl --help
+```
+
+The app will refuse to start and display this instruction if the rule is missing.
+
+---
+
+### 4. Verify Without Sudo
 
 Test it in your terminal as a normal user:
 
