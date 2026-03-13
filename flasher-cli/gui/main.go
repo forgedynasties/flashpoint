@@ -188,16 +188,16 @@ func main() {
 	listVBox := container.NewVBox()
 
 	refreshListUI := func(devs []device.Info) {
-		// Drop rows for devices that disappeared.
+		// Drop rows for devices that disappeared (keyed by USBPath).
 		active := make(map[string]bool, len(devs))
 		for _, d := range devs {
-			active[d.Serial] = true
+			active[d.USBPath] = true
 		}
-		for serial := range rowMap {
-			if !active[serial] {
-				delete(rowMap, serial)
+		for key := range rowMap {
+			if !active[key] {
+				delete(rowMap, key)
 				st.mu.Lock()
-				delete(st.selected, serial)
+				delete(st.selected, key)
 				st.mu.Unlock()
 			}
 		}
@@ -206,13 +206,13 @@ func main() {
 		objects := make([]fyne.CanvasObject, 0, len(devs))
 		for _, d := range devs {
 			d := d
-			r, exists := rowMap[d.Serial]
+			key := d.USBPath // unique per physical port
+			r, exists := rowMap[key]
 			if !exists {
 				// Create all widgets for this device exactly once.
-				serial := d.Serial
 				check := widget.NewCheck("", func(v bool) {
 					st.mu.Lock()
-					st.selected[serial] = v
+					st.selected[key] = v
 					st.mu.Unlock()
 				})
 				modeLbl := widget.NewLabel(string(d.Mode))
@@ -234,7 +234,7 @@ func main() {
 						rebootBtn,
 					),
 				}
-				rowMap[d.Serial] = r
+				rowMap[key] = r
 			} else {
 				// Only update the fields that can change.
 				r.mode.SetText(string(d.Mode))
@@ -273,7 +273,7 @@ func main() {
 		st.mu.Lock()
 		var serials []string
 		for _, d := range st.devices {
-			if st.selected[d.Serial] && d.Mode == device.ModeEDL {
+			if st.selected[d.USBPath] && d.Mode == device.ModeEDL {
 				serials = append(serials, d.Serial)
 			}
 		}
