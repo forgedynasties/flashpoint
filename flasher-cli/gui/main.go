@@ -29,6 +29,16 @@ type appState struct {
 	flashing bool
 }
 
+// deviceRow holds the stable widget instances for one device.
+// Created once per serial; never recycled.
+type deviceRow struct {
+	mode   *widget.Label
+	path   *widget.Label
+	build  *widget.Label
+	reboot *widget.Button
+	row    *fyne.Container
+}
+
 func main() {
 	a := app.New()
 	a.Settings().SetTheme(theme.LightTheme())
@@ -120,7 +130,6 @@ func main() {
 		}
 		pRows := make(map[string]*pRow, len(serials))
 
-		// Reset progress UI
 		progressBody.Objects = nil
 		for _, s := range serials {
 			bar := widget.NewProgressBar()
@@ -171,6 +180,83 @@ func main() {
 	}
 
 	// ── Device list ───────────────────────────────────────────────
+	// Each device gets its own stable row widgets created once.
+	// OnChanged is set at creation and never reassigned, so there
+	// is no recycling/capture bug.
+
+	rowMap := make(map[string]*deviceRow)
+	listVBox := container.NewVBox()
+
+	refreshListUI := func(devs []device.Info) {
+		// Drop rows for devices that disappeared.
+		active := make(map[string]bool, len(devs))
+		for _, d := range devs {
+			active[d.Serial] = true
+		}
+		for serial := range rowMap {
+			if !active[serial] {
+				delete(rowMap, serial)
+				st.mu.Lock()
+				delete(st.selected, serial)
+				st.mu.Unlock()
+			}
+		}
+
+		// Build the ordered row list.
+		objects := make([]fyne.CanvasObject, 0, len(devs))
+		for _, d := range devs {
+			d := d
+			r, exists := rowMap[d.Serial]
+			if !exists {
+				// Create all widgets for this device exactly once.
+				serial := d.Serial
+				check := widget.NewCheck("", func(v bool) {
+					st.mu.Lock()
+					st.selected[serial] = v
+					st.mu.Unlock()
+				})
+				modeLbl := widget.NewLabel(string(d.Mode))
+				pathLbl := widget.NewLabel(d.USBPath)
+				buildLbl := widget.NewLabel(buildIDText(d.BuildID))
+				rebootBtn := widget.NewButton("→ EDL", nil)
+
+				r = &deviceRow{
+					mode:   modeLbl,
+					path:   pathLbl,
+					build:  buildLbl,
+					reboot: rebootBtn,
+					row: container.NewGridWithColumns(6,
+						check,
+						widget.NewLabel(d.Serial),
+						modeLbl,
+						pathLbl,
+						buildLbl,
+						rebootBtn,
+					),
+				}
+				rowMap[d.Serial] = r
+			} else {
+				// Only update the fields that can change.
+				r.mode.SetText(string(d.Mode))
+				r.path.SetText(d.USBPath)
+				r.build.SetText(buildIDText(d.BuildID))
+			}
+
+			// Reboot button state always needs refreshing (ADB comes and goes).
+			transport := d.ADBTransport
+			if d.HasADB && d.Mode != device.ModeEDL {
+				r.reboot.Enable()
+				r.reboot.OnTapped = func() { go adb.RebootEDL(transport) }
+			} else {
+				r.reboot.Disable()
+			}
+
+			objects = append(objects, r.row)
+		}
+
+		listVBox.Objects = objects
+		listVBox.Refresh()
+	}
 
 	colHeader := container.NewGridWithColumns(6,
 		widget.NewLabel(""),
@@ -180,70 +266,6 @@ func main() {
 		widget.NewLabelWithStyle("BUILD ID", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewLabel(""),
 	)
-
-	deviceList := widget.NewList(
-		func() int {
-			st.mu.Lock()
-			defer st.mu.Unlock()
-			return len(st.devices)
-		},
-		func() fyne.CanvasObject {
-			return container.NewGridWithColumns(6,
-				widget.NewCheck("", nil),
-				widget.NewLabel(""),
-				widget.NewLabel(""),
-				widget.NewLabel(""),
-				widget.NewLabel(""),
-				widget.NewButton("→ EDL", nil),
-			)
-		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			st.mu.Lock()
-			if id >= len(st.devices) {
-				st.mu.Unlock()
-				return
-			}
-			d := st.devices[id]
-			checked := st.selected[d.Serial]
-			st.mu.Unlock()
-
-			row := obj.(*fyne.Container)
-			check := row.Objects[0].(*widget.Check)
-			serialLbl := row.Objects[1].(*widget.Label)
-			modeLbl := row.Objects[2].(*widget.Label)
-			pathLbl := row.Objects[3].(*widget.Label)
-			buildLbl := row.Objects[4].(*widget.Label)
-			rebootBtn := row.Objects[5].(*widget.Button)
-
-			serial := d.Serial
-			check.Checked = checked
-			check.OnChanged = func(v bool) {
-				st.mu.Lock()
-				st.selected[serial] = v
-				st.mu.Unlock()
-			}
-			check.Refresh()
-
-			serialLbl.SetText(d.Serial)
-			modeLbl.SetText(string(d.Mode))
-			pathLbl.SetText(d.USBPath)
-			buildID := d.BuildID
-			if buildID == "" {
-				buildID = "—"
-			}
-			buildLbl.SetText(buildID)
-
-			transport := d.ADBTransport
-			if d.HasADB && d.Mode != device.ModeEDL {
-				rebootBtn.Enable()
-				rebootBtn.OnTapped = func() { go adb.RebootEDL(transport) }
-			} else {
-				rebootBtn.Disable()
-			}
-		},
-	)
-	// Suppress Fyne's built-in row selection highlight
-	deviceList.OnUnselected = func(widget.ListItemID) {}
 
 	// ── Flash buttons ─────────────────────────────────────────────
 
@@ -276,7 +298,7 @@ func main() {
 		container.NewVBox(colHeader, widget.NewSeparator()),
 		container.NewVBox(widget.NewSeparator(), container.NewHBox(flashSelBtn, flashAllBtn)),
 		nil, nil,
-		deviceList,
+		container.NewVScroll(listVBox),
 	))
 
 	// ── Auto-refresh goroutine ────────────────────────────────────
@@ -305,8 +327,9 @@ func main() {
 			st.mu.Lock()
 			st.devices = devs
 			st.mu.Unlock()
+
 			fyne.Do(func() {
-				deviceList.Refresh()
+				refreshListUI(devs)
 			})
 		}
 	}()
@@ -320,4 +343,11 @@ func main() {
 		deviceCard,
 	))
 	w.ShowAndRun()
+}
+
+func buildIDText(id string) string {
+	if id == "" {
+		return "—"
+	}
+	return id
 }
