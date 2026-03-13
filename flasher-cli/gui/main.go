@@ -25,13 +25,13 @@ import (
 type appState struct {
 	mu       sync.Mutex
 	devices  []device.Info
-	selected map[string]bool
-	flashing bool
+	selected map[string]bool // keyed by USBPath
+	running  bool
 }
 
-// deviceRow holds the stable widget instances for one device.
-// Created once per serial; never recycled.
+// deviceRow holds stable widget instances for one device — created once, never recycled.
 type deviceRow struct {
+	check  *widget.Check
 	mode   *widget.Label
 	path   *widget.Label
 	build  *widget.Label
@@ -93,17 +93,51 @@ func main() {
 		),
 	))
 
-	// ── Progress section (declared early for use in startFlash) ───
+	// ── Progress section ──────────────────────────────────────────
 
 	progressBody := container.NewVBox()
 	progressCard := widget.NewCard("Flash Progress", "", container.NewVScroll(progressBody))
 	progressCard.Hide()
 
+	// ── Action buttons (declared early; wired to logic below) ─────
+
+	flashSelBtn := widget.NewButton("Flash Selected", nil)
+	flashSelBtn.Importance = widget.HighImportance
+
+	flashAllBtn := widget.NewButton("Flash All EDL", nil)
+
+	rebootSelBtn := widget.NewButton("Reboot Selected → EDL", nil)
+
+	rebootFlashBtn := widget.NewButton("Reboot & Flash", nil)
+	rebootFlashBtn.Importance = widget.WarningImportance
+
+	selectAllBtn := widget.NewButton("Select All", nil)
+	deselectAllBtn := widget.NewButton("Deselect All", nil)
+
+	allActionBtns := []*widget.Button{
+		flashSelBtn, flashAllBtn, rebootSelBtn, rebootFlashBtn, selectAllBtn, deselectAllBtn,
+	}
+
+	setRunning := func(r bool) {
+		st.mu.Lock()
+		st.running = r
+		st.mu.Unlock()
+		fyne.Do(func() {
+			for _, b := range allActionBtns {
+				if r {
+					b.Disable()
+				} else {
+					b.Enable()
+				}
+			}
+		})
+	}
+
 	// ── Flash logic ───────────────────────────────────────────────
 
 	startFlash := func(serials []string) {
 		if len(serials) == 0 {
-			dialog.ShowInformation("Nothing to flash", "No EDL devices selected.", w)
+			dialog.ShowInformation("Nothing to flash", "No EDL devices to flash.", w)
 			return
 		}
 		fwDir := fwEntry.Text
@@ -119,9 +153,7 @@ func main() {
 			return
 		}
 
-		st.mu.Lock()
-		st.flashing = true
-		st.mu.Unlock()
+		setRunning(true)
 
 		type pRow struct {
 			bar    *widget.ProgressBar
@@ -173,22 +205,18 @@ func main() {
 					}
 				})
 			}
-			st.mu.Lock()
-			st.flashing = false
-			st.mu.Unlock()
+			setRunning(false)
 		}()
 	}
 
 	// ── Device list ───────────────────────────────────────────────
-	// Each device gets its own stable row widgets created once.
-	// OnChanged is set at creation and never reassigned, so there
-	// is no recycling/capture bug.
 
 	rowMap := make(map[string]*deviceRow)
-	listVBox := container.NewVBox()
+	listScroll := container.NewVScroll(container.NewVBox())
+	countLabel := widget.NewLabel("0 devices")
 
 	refreshListUI := func(devs []device.Info) {
-		// Drop rows for devices that disappeared (keyed by USBPath).
+		// Remove rows for gone devices.
 		active := make(map[string]bool, len(devs))
 		for _, d := range devs {
 			active[d.USBPath] = true
@@ -202,14 +230,13 @@ func main() {
 			}
 		}
 
-		// Build the ordered row list.
-		objects := make([]fyne.CanvasObject, 0, len(devs))
+		// Build ordered rows.
+		rows := make([]fyne.CanvasObject, 0, len(devs))
 		for _, d := range devs {
 			d := d
-			key := d.USBPath // unique per physical port
+			key := d.USBPath
 			r, exists := rowMap[key]
 			if !exists {
-				// Create all widgets for this device exactly once.
 				check := widget.NewCheck("", func(v bool) {
 					st.mu.Lock()
 					st.selected[key] = v
@@ -221,6 +248,7 @@ func main() {
 				rebootBtn := widget.NewButton("→ EDL", nil)
 
 				r = &deviceRow{
+					check:  check,
 					mode:   modeLbl,
 					path:   pathLbl,
 					build:  buildLbl,
@@ -236,13 +264,11 @@ func main() {
 				}
 				rowMap[key] = r
 			} else {
-				// Only update the fields that can change.
 				r.mode.SetText(string(d.Mode))
 				r.path.SetText(d.USBPath)
 				r.build.SetText(buildIDText(d.BuildID))
 			}
 
-			// Reboot button state always needs refreshing (ADB comes and goes).
 			transport := d.ADBTransport
 			if d.HasADB && d.Mode != device.ModeEDL {
 				r.reboot.Enable()
@@ -251,11 +277,13 @@ func main() {
 				r.reboot.Disable()
 			}
 
-			objects = append(objects, r.row)
+			rows = append(rows, r.row)
 		}
 
-		listVBox.Objects = objects
-		listVBox.Refresh()
+		// Replace scroll content entirely so Fyne re-layouts from scratch.
+		listScroll.Content = container.NewVBox(rows...)
+		listScroll.Refresh()
+		countLabel.SetText(fmt.Sprintf("%d device(s)", len(devs)))
 	}
 
 	colHeader := container.NewGridWithColumns(6,
@@ -267,9 +295,33 @@ func main() {
 		widget.NewLabel(""),
 	)
 
-	// ── Flash buttons ─────────────────────────────────────────────
+	// ── Wire up action buttons ────────────────────────────────────
 
-	flashSelBtn := widget.NewButton("Flash Selected", func() {
+	selectAllBtn.OnTapped = func() {
+		st.mu.Lock()
+		for _, d := range st.devices {
+			st.selected[d.USBPath] = true
+		}
+		st.mu.Unlock()
+		// Sync checkboxes
+		for key, r := range rowMap {
+			_ = key
+			r.check.SetChecked(true)
+		}
+	}
+
+	deselectAllBtn.OnTapped = func() {
+		st.mu.Lock()
+		for k := range st.selected {
+			st.selected[k] = false
+		}
+		st.mu.Unlock()
+		for _, r := range rowMap {
+			r.check.SetChecked(false)
+		}
+	}
+
+	flashSelBtn.OnTapped = func() {
 		st.mu.Lock()
 		var serials []string
 		for _, d := range st.devices {
@@ -279,10 +331,9 @@ func main() {
 		}
 		st.mu.Unlock()
 		startFlash(serials)
-	})
-	flashSelBtn.Importance = widget.HighImportance
+	}
 
-	flashAllBtn := widget.NewButton("Flash All EDL", func() {
+	flashAllBtn.OnTapped = func() {
 		st.mu.Lock()
 		var serials []string
 		for _, d := range st.devices {
@@ -292,13 +343,97 @@ func main() {
 		}
 		st.mu.Unlock()
 		startFlash(serials)
-	})
+	}
+
+	rebootSelBtn.OnTapped = func() {
+		st.mu.Lock()
+		var transports []string
+		for _, d := range st.devices {
+			if st.selected[d.USBPath] && d.HasADB && d.Mode != device.ModeEDL {
+				transports = append(transports, d.ADBTransport)
+			}
+		}
+		st.mu.Unlock()
+		if len(transports) == 0 {
+			dialog.ShowInformation("Nothing to reboot", "No selected booted devices with ADB.", w)
+			return
+		}
+		for _, t := range transports {
+			go adb.RebootEDL(t)
+		}
+	}
+
+	rebootFlashBtn.OnTapped = func() {
+		st.mu.Lock()
+		type bootedDev struct {
+			usbPath   string
+			transport string
+		}
+		var targets []bootedDev
+		for _, d := range st.devices {
+			if st.selected[d.USBPath] && d.HasADB && d.Mode != device.ModeEDL {
+				targets = append(targets, bootedDev{d.USBPath, d.ADBTransport})
+			}
+		}
+		st.mu.Unlock()
+
+		if len(targets) == 0 {
+			dialog.ShowInformation("Nothing to do", "No selected booted devices with ADB.", w)
+			return
+		}
+
+		setRunning(true)
+
+		go func() {
+			// Step 1: reboot all to EDL.
+			for _, t := range targets {
+				adb.RebootEDL(t.transport)
+			}
+
+			// Step 2: wait up to 30s for them to reappear as EDL.
+			paths := make(map[string]bool, len(targets))
+			for _, t := range targets {
+				paths[t.usbPath] = true
+			}
+
+			deadline := time.Now().Add(30 * time.Second)
+			var edlSerials []string
+			for time.Now().Before(deadline) {
+				time.Sleep(500 * time.Millisecond)
+				devs, _ := usb.Scan()
+				edlSerials = nil
+				for _, d := range devs {
+					if d.Mode == device.ModeEDL && paths[d.USBPath] {
+						edlSerials = append(edlSerials, d.Serial)
+					}
+				}
+				if len(edlSerials) == len(targets) {
+					break
+				}
+			}
+
+			if len(edlSerials) == 0 {
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("devices did not appear in EDL within 30s"), w)
+				})
+				setRunning(false)
+				return
+			}
+
+			// Step 3: flash.
+			startFlash(edlSerials)
+		}()
+	}
 
 	deviceCard := widget.NewCard("Devices", "", container.NewBorder(
 		container.NewVBox(colHeader, widget.NewSeparator()),
-		container.NewVBox(widget.NewSeparator(), container.NewHBox(flashSelBtn, flashAllBtn)),
+		container.NewVBox(
+			widget.NewSeparator(),
+			container.NewHBox(selectAllBtn, deselectAllBtn, countLabel),
+			container.NewHBox(rebootSelBtn, flashSelBtn, flashAllBtn, rebootFlashBtn),
+		),
 		nil, nil,
-		container.NewVScroll(listVBox),
+		listScroll,
 	))
 
 	// ── Auto-refresh goroutine ────────────────────────────────────
@@ -308,9 +443,9 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			st.mu.Lock()
-			isFlashing := st.flashing
+			isRunning := st.running
 			st.mu.Unlock()
-			if isFlashing {
+			if isRunning {
 				continue
 			}
 
