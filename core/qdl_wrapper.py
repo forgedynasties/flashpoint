@@ -52,7 +52,7 @@ class FlashManager:
             list: Command arguments for subprocess
         """
         return [
-            "sudo",
+            "sudo", "-n",
             QDL_BIN,
             "-S",
             serial,

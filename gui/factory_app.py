@@ -95,6 +95,9 @@ class FactoryStation(BaseFlashStation):
         self.run_active  = False
         self.run_serials: set[str] = set()
         self.cycle_start: datetime | None = None
+        # Processes killed mid-run are held here until they actually exit so
+        # the QProcess object is not GC'd while the OS process is still alive.
+        self._dying_procs: list[QProcess] = []
 
         self._setup_ui()
         self._setup_scanning()
@@ -363,11 +366,17 @@ class FactoryStation(BaseFlashStation):
         self._check_complete()
 
     def _stop_run(self):
-        # Kill any in-flight processes
+        # Kill any in-flight processes, keeping them in _dying_procs so the
+        # QProcess object is not GC'd before the OS process actually exits.
         for serial, procs in self._procs.items():
             for key in ("process", "build_id_proc"):
                 p = procs.get(key)
                 if p and p.state() != QProcess.ProcessState.NotRunning:
+                    self._dying_procs.append(p)
+                    p.finished.connect(
+                        lambda *_, proc=p: self._dying_procs.remove(proc)
+                        if proc in self._dying_procs else None
+                    )
                     p.kill()
             procs["process"] = None
             procs["build_id_proc"] = None
@@ -406,11 +415,14 @@ class FactoryStation(BaseFlashStation):
             return
 
         w = self._widgets.get(serial, {})
+        # Capture the pipeline instance so we can detect stale callbacks that
+        # fire after a new cycle has started (new pipeline != captured one).
+        bound_pipeline = self._pipeline
 
         def on_done(code: int) -> None:
             procs["process"] = None
-            if self._pipeline is None:
-                return
+            if self._pipeline is not bound_pipeline:
+                return  # stale callback from a previous run
             if code == 0 and w:
                 w["progress"].setValue(100)
             self._pipeline.flash_done(serial, stage, code)
@@ -444,12 +456,13 @@ class FactoryStation(BaseFlashStation):
         device.transport_id = tid
 
         self._build_id_in_flight.add(serial)
+        bound_pipeline = self._pipeline
 
         def on_result(output: str) -> None:
             self._build_id_in_flight.discard(serial)
             procs["build_id_proc"] = None
-            if self._pipeline is None or serial not in self._devices:
-                return
+            if self._pipeline is not bound_pipeline or serial not in self._devices:
+                return  # stale callback from a previous run
             self._pipeline.build_id_result(serial, output)
 
         procs["build_id_proc"] = self._launch_build_id_check(tid, on_result)
