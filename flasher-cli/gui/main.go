@@ -143,23 +143,26 @@ func main() {
 
 		go func() {
 			for u := range updates {
+				u := u
 				pr, ok := pRows[u.Serial]
 				if !ok {
 					continue
 				}
-				pr.bar.SetValue(float64(u.Progress))
-				pr.pct.SetText(fmt.Sprintf("%3d%%", u.Progress))
-				if u.Done {
-					if u.Success {
-						pr.status.SetText("✓ done")
-					} else {
-						msg := "✗ failed"
-						if u.Err != nil {
-							msg = "✗ " + u.Err.Error()
+				fyne.Do(func() {
+					pr.bar.SetValue(float64(u.Progress))
+					pr.pct.SetText(fmt.Sprintf("%3d%%", u.Progress))
+					if u.Done {
+						if u.Success {
+							pr.status.SetText("✓ done")
+						} else {
+							msg := "✗ failed"
+							if u.Err != nil {
+								msg = "✗ " + u.Err.Error()
+							}
+							pr.status.SetText(msg)
 						}
-						pr.status.SetText(msg)
 					}
-				}
+				})
 			}
 			st.mu.Lock()
 			st.flashing = false
@@ -302,7 +305,9 @@ func main() {
 			st.mu.Lock()
 			st.devices = devs
 			st.mu.Unlock()
-			deviceList.Refresh()
+			fyne.Do(func() {
+				deviceList.Refresh()
+			})
 		}
 	}()
 
