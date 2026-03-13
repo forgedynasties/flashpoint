@@ -23,7 +23,8 @@ from config import (
 )
 from gui.styles import Styles, Colors
 from core.device import Device
-from core.scanner import scan_edl, scan_adb
+from core.scanner import scan_edl, scan_adb_path_map
+from core.cycle_logger import CycleLogger
 from core.pipeline import (
     FactoryPipeline,
     S_WAITING, S_SKIPPED, S_FLASH1, S_BOOTING,
@@ -90,6 +91,7 @@ class FactoryStation(BaseFlashStation):
         self._build_id_in_flight: set[str] = set()
 
         self._pipeline: FactoryPipeline | None = None
+        self._logger:   CycleLogger | None = None
         self.run_active  = False
         self.run_serials: set[str] = set()
         self.cycle_start: datetime | None = None
@@ -192,7 +194,6 @@ class FactoryStation(BaseFlashStation):
 
     def _scan(self):
         edl_devices = scan_edl()   # {serial: Device}
-        adb_map     = scan_adb()   # {serial: tid}
 
         if not self.run_active:
             # Pre-run: track EDL devices, allow row addition/removal
@@ -204,10 +205,15 @@ class FactoryStation(BaseFlashStation):
                 if serial not in edl_devices:
                     self._remove_row(serial)
         else:
-            # During run: update transport IDs for booted devices
-            for serial, tid in adb_map.items():
-                if serial in self._devices:
-                    self._devices[serial].transport_id = tid
+            # During run: match booted devices by USB path — always stable,
+            # even when ADB serial reports as '?' (e.g. fresh factory firmware).
+            path_map = scan_adb_path_map()  # {usb_path: tid}
+            adb_map: dict[str, str] = {}
+            for serial, device in self._devices.items():
+                if device.usb_path and device.usb_path in path_map:
+                    tid = path_map[device.usb_path]
+                    device.transport_id = tid
+                    adb_map[serial] = tid
             # Advance pipeline and drain queued actions
             self._pipeline.tick(set(edl_devices.keys()), adb_map)
             self._drain_pending_actions()
@@ -274,6 +280,8 @@ class FactoryStation(BaseFlashStation):
     # ── State updates (called via pipeline callbacks) ─────────────────────────
 
     def _on_state_change(self, serial: str, state: str, reason: str):
+        if self._logger:
+            self._logger.event(serial, f"{state}{': ' + reason if reason else ''}")
         w = self._widgets.get(serial)
         if not w:
             return
@@ -314,6 +322,8 @@ class FactoryStation(BaseFlashStation):
             w["progress"].setValue(pct)
 
     def _on_log(self, serial: str, text: str):
+        if self._logger:
+            self._logger.event(serial, text)
         w = self._widgets.get(serial)
         if w:
             w["log_lbl"].setText(text)
@@ -335,6 +345,9 @@ class FactoryStation(BaseFlashStation):
         self.btn_start.setEnabled(False)
         self.btn_start.setText("Running...")
         self.btn_stop.setEnabled(True)
+
+        self._logger = CycleLogger(self.reports_dir, self.cycle_start)
+        self._logger.snapshot("start")
 
         self._pipeline = FactoryPipeline(
             devices=list(edl_devices.values()),
@@ -370,6 +383,9 @@ class FactoryStation(BaseFlashStation):
         self.run_active = False
         self.run_serials.clear()
         self._pipeline = None
+        if self._logger:
+            self._logger.close("stopped by operator")
+            self._logger = None
         self.btn_stop.setEnabled(False)
         self.btn_start.setEnabled(True)
         self.btn_start.setText("Start")
@@ -417,8 +433,15 @@ class FactoryStation(BaseFlashStation):
             return
 
         device = self._devices.get(serial)
-        if not device or not device.transport_id:
+        if not device or not device.usb_path:
             return
+
+        # Always resolve a fresh transport_id via USB path immediately before
+        # the ADB call — transport IDs reset on every device reboot.
+        tid = scan_adb_path_map().get(device.usb_path)
+        if not tid:
+            return
+        device.transport_id = tid
 
         self._build_id_in_flight.add(serial)
 
@@ -429,9 +452,7 @@ class FactoryStation(BaseFlashStation):
                 return
             self._pipeline.build_id_result(serial, output)
 
-        procs["build_id_proc"] = self._launch_build_id_check(
-            device.transport_id, on_result
-        )
+        procs["build_id_proc"] = self._launch_build_id_check(tid, on_result)
 
     # ── Session complete ───────────────────────────────────────────────────────
 
@@ -536,6 +557,11 @@ class FactoryStation(BaseFlashStation):
                 f.write(text + "\n")
         except Exception as e:
             print(f"[factory] could not save report: {e}")
+
+        if self._logger:
+            self._logger.snapshot("end")
+            self._logger.close(text)
+            self._logger = None
 
     def _new_cycle(self):
         for serial in list(self._widgets.keys()):

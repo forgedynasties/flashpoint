@@ -81,12 +81,36 @@ def scan_edl() -> dict[str, Device]:
 
 
 def scan_adb() -> dict[str, str]:
-    """Return {serial: transport_id} for all devices visible to adb."""
+    """Return {serial: transport_id} for all devices visible to adb.
+
+    Devices that report '?' as their ADB serial (e.g. freshly factory-flashed
+    devices without a configured Android serial) are excluded from this map;
+    use scan_adb_path_map() to reach them by USB path.
+    """
     result: dict[str, str] = {}
     try:
         out = subprocess.check_output(["adb", "devices", "-l"]).decode()
         for line in out.splitlines():
             m = re.match(r"^(\S+)\s+\w+.*transport_id:(\d+)", line)
+            if m and m.group(1) != "?":
+                result[m.group(1)] = m.group(2)
+    except Exception:
+        pass
+    return result
+
+
+def scan_adb_path_map() -> dict[str, str]:
+    """Return {usb_path: transport_id} for every ADB-visible device.
+
+    usb_path is the sysfs-style path from the 'usb:' field in
+    'adb devices -l' output (e.g. '3-1.4.2').  This is the only stable
+    identifier for devices whose ADB serial is '?'.
+    """
+    result: dict[str, str] = {}
+    try:
+        out = subprocess.check_output(["adb", "devices", "-l"]).decode()
+        for line in out.splitlines():
+            m = re.search(r"usb:(\S+).*transport_id:(\d+)", line)
             if m:
                 result[m.group(1)] = m.group(2)
     except Exception:
@@ -101,17 +125,9 @@ def scan_all() -> dict[str, Device]:
     # EDL devices
     devices.update(scan_edl())
 
-    # ADB lookup tables: serial→tid (from scan_adb) and usb_path→tid
-    serial_to_tid: dict[str, str] = scan_adb()
-    path_to_tid: dict[str, str] = {}
-    try:
-        out = subprocess.check_output(["adb", "devices", "-l"]).decode()
-        for line in out.splitlines():
-            m = re.search(r"usb:(\S+).*transport_id:(\d+)", line)
-            if m:
-                path_to_tid[m.group(1)] = m.group(2)
-    except Exception:
-        pass
+    # Always resolve transport IDs by USB path — stable across reboots and
+    # works even when the ADB serial is '?' (e.g. fresh factory firmware).
+    path_to_tid: dict[str, str] = scan_adb_path_map()
 
     # Booted devices via lsusb
     try:
@@ -148,10 +164,7 @@ def scan_all() -> dict[str, Device]:
                 if any(pid in line for pid in USB_PIDs["USER_BOOTED"])
                 else "debug"
             )
-            tid = (
-                serial_to_tid.get(hw_sn)
-                or (path_to_tid.get(usb_path) if usb_path else None)
-            )
+            tid = path_to_tid.get(usb_path) if usb_path else None
             devices[hw_sn] = Device(
                 serial=hw_sn,
                 mode=mode,

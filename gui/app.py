@@ -11,7 +11,7 @@ from PyQt6.QtGui import QColor, QPen, QBrush
 from config import FW_PATH_ENV
 from gui.styles import Styles, Colors, STATUS_COLORS
 from core.device import Device
-from core.scanner import scan_all
+from core.scanner import scan_all, scan_adb_path_map
 from core.qdl_wrapper import FlashManager
 from gui.base_station import BaseFlashStation
 
@@ -474,10 +474,16 @@ class FlashStation(BaseFlashStation):
 
     def _handle_edl_reboot(self, serial: str):
         device = self.devices.get(serial)
-        if device and device.has_adb:
-            device.reboot_to_edl()
-            self.edl_pending.add(serial)
-            self._update_ui_lock()
+        if not device or not device.usb_path:
+            return
+        # Always resolve a fresh transport_id via USB path before the ADB call.
+        tid = scan_adb_path_map().get(device.usb_path)
+        if not tid:
+            return
+        device.transport_id = tid
+        device.reboot_to_edl()
+        self.edl_pending.add(serial)
+        self._update_ui_lock()
 
     def reboot_all_to_edl(self):
         for serial, device in list(self.devices.items()):
