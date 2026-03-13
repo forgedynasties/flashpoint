@@ -44,7 +44,6 @@ func Device(ctx context.Context, serial string, fw *firmware.Files, dryRun bool,
 	bin := qdlBin()
 
 	args := []string{
-		bin,
 		"-S", serial,
 		"--storage", "emmc",
 		fw.Prog,
@@ -56,7 +55,7 @@ func Device(ctx context.Context, serial string, fw *firmware.Files, dryRun bool,
 		args = append(args, "-n")
 	}
 
-	cmd := exec.CommandContext(ctx, "sudo", args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = fw.Dir
 
 	// stdout carries ux_info / ux_log messages (newline-terminated).

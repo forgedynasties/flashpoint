@@ -98,7 +98,7 @@ func parseLsusb() ([]lsusbEntry, error) {
 
 // lsusbVerboseSerial runs "lsusb -v -s BUS:DEV" and extracts the iSerial value.
 func lsusbVerboseSerial(bus, devnum string) (string, error) {
-	out, err := runCommandSudo("lsusb", "-v", "-s", fmt.Sprintf("%s:%s", bus, devnum))
+	out, err := runCommand("lsusb", "-v", "-s", fmt.Sprintf("%s:%s", bus, devnum))
 	if err != nil {
 		return "", err
 	}
