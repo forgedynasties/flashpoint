@@ -103,11 +103,9 @@ class DeviceScanner:
 
     @staticmethod
     def _serial_from_device(device):
-        """Read USB serial from a pyudev device, stripping any _SN: prefix."""
+        """Read USB iSerial string (used for display / ADB identification)."""
         try:
-            raw = device.attributes.asstring('serial')
-            m = re.search(r'_SN:([0-9a-fA-F]+)', raw)
-            return m.group(1) if m else raw
+            return device.attributes.asstring('serial') or None
         except KeyError:
             return None
 
@@ -163,11 +161,12 @@ class DeviceScanner:
                     log.debug("Skipping booted device with no path (vid=%s pid=%s)", vid, pid)
                     continue
 
-                hw_sn = DeviceScanner._serial_from_device(device) or path
+                hw_sn = DeviceScanner._serial_from_device(device) or ""
                 has_adb = (vidpid in ("18d1:4e11", "05c6:901f") or path in usb_to_tid)
 
                 devices[path] = {
                     "serial": hw_sn,
+                    "qdl_serial": "",  # filled in by scan_all from qdl list-server
                     "mode": mode,
                     "has_adb": has_adb,
                     "path": path,
@@ -197,17 +196,23 @@ class DeviceScanner:
         edl_devices = DeviceScanner.get_edl_devices(list_socket)
         for path, info in edl_devices.items():
             currently_connected.add(path)
+            qdl_serial = info.get("serial", "")
             devices_info[path] = {
                 "mode": "EDL",
                 "has_adb": False,
                 "path": path,
-                "serial": info.get("serial", ""),
+                "serial": qdl_serial,
+                "qdl_serial": qdl_serial,  # list-server serial is authoritative for qdl
             }
         log.info("[EDL-TRACE] scan_all: %d EDL device(s): %s", len(edl_devices), list(edl_devices.keys()))
 
         booted_devices = DeviceScanner.get_booted_devices()
         for path, info in booted_devices.items():
             currently_connected.add(path)
+            # For EDL devices detected via pyudev: get qdl_serial from the
+            # list-server, which is the authoritative source.
+            if info.get("mode") == "EDL":
+                info["qdl_serial"] = (edl_devices.get(path) or {}).get("serial", "")
             devices_info[path] = info
             if info.get("has_adb") and "adb_tid" in info:
                 build_id = DeviceScanner.get_build_id(info["adb_tid"])

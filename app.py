@@ -269,11 +269,20 @@ class FlashStation(QMainWindow):
             serial = info.get("serial", usb_path)
 
             if usb_path not in self.devices:
-                log.info("[EDL-TRACE] scan: NEW device at %s (serial=%r), calling add_device_row", usb_path, serial)
+                log.info("[EDL-TRACE] scan: NEW device at %s (serial=%r qdl_serial=%r), calling add_device_row", usb_path, serial, info.get("qdl_serial", ""))
                 self.add_device_row(usb_path, serial)
+                self.devices[usb_path]["qdl_serial"] = info.get("qdl_serial", "")
                 log.info("[EDL-TRACE] scan: add_device_row done, table rows now: %d", self.table.rowCount())
             else:
-                log.info("[EDL-TRACE] scan: existing device at %s (serial=%r)", usb_path, serial)
+                device_info = self.devices[usb_path]
+                # Preserve existing serial — don't overwrite with empty string.
+                if serial and serial != existing_serial := device_info["serial"]:
+                    device_info["serial"] = serial
+                # Update qdl_serial whenever we get one (it's stable per device).
+                qdl_serial = info.get("qdl_serial", "")
+                if qdl_serial and not device_info["qdl_serial"]:
+                    device_info["qdl_serial"] = qdl_serial
+                log.info("[EDL-TRACE] scan: existing device at %s (serial=%r qdl_serial=%r)", usb_path, device_info["serial"], device_info["qdl_serial"])
 
             device_info = self.devices[usb_path]
 
@@ -419,6 +428,7 @@ class FlashStation(QMainWindow):
 
         self.devices[usb_path] = {
             "serial": serial,
+            "qdl_serial": "",
             "row": row,
             "chk": chk,
             "status_item": status_item,
@@ -692,7 +702,7 @@ class FlashStation(QMainWindow):
 
         device_info = self.devices[usb_path]
         process_info = self.device_processes[usb_path]
-        serial = device_info["serial"]
+        serial = device_info["qdl_serial"] or device_info["serial"]
 
         if process_info["is_flashing"]:
             return
