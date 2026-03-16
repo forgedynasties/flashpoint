@@ -46,16 +46,20 @@ class DeviceScanner:
                     break
                 buf += chunk
             sock.close()
-            devices = json.loads(buf.decode())
-            log.debug("qdl list-server returned %d device(s)", len(devices))
+            raw = buf.decode()
+            log.info("[EDL-TRACE] raw socket response: %r", raw)
+            devices = json.loads(raw)
+            log.info("[EDL-TRACE] parsed %d device(s) from list-server", len(devices))
+            for d in devices:
+                log.info("[EDL-TRACE]   entry: %s", d)
             return devices
         except FileNotFoundError:
-            log.warning("qdl list-server socket not found at %s — "
+            log.warning("[EDL-TRACE] list-server socket not found at %s — "
                         "run: sudo qdl list-server --socket %s",
                         socket_path, socket_path)
             return None
         except Exception as exc:
-            log.warning("qdl list-server query failed (%s): %s", socket_path, exc)
+            log.warning("[EDL-TRACE] list-server query failed (%s): %s", socket_path, exc)
             return None
 
     @staticmethod
@@ -74,9 +78,11 @@ class DeviceScanner:
             serial = (dev.get("serial") or "").strip()
             key = path or serial  # path is preferred; fall back to serial if qdl omits it
             if not key:
+                log.warning("[EDL-TRACE] skipping entry with no path and no serial: %s", dev)
                 continue
             devices[key] = {"serial": serial, "usb_path": path or None}
-            log.debug("EDL device: serial=%s path=%s", serial, path)
+            log.info("[EDL-TRACE] get_edl_devices: key=%r serial=%r path=%r", key, serial, path)
+        log.info("[EDL-TRACE] get_edl_devices returning keys: %s", list(devices.keys()))
         return devices
 
     # ------------------------------------------------------------------
@@ -196,6 +202,7 @@ class DeviceScanner:
                 "path": path,
                 "serial": info.get("serial", ""),
             }
+        log.info("[EDL-TRACE] scan_all: %d EDL device(s): %s", len(edl_devices), list(edl_devices.keys()))
 
         booted_devices = DeviceScanner.get_booted_devices()
         for path, info in booted_devices.items():
@@ -205,6 +212,6 @@ class DeviceScanner:
                 build_id = DeviceScanner.get_build_id(info["adb_tid"])
                 if build_id:
                     devices_info[path]["build_id"] = build_id
-
-        log.debug("scan_all: %d device(s) connected", len(currently_connected))
+        log.info("[EDL-TRACE] scan_all: %d booted device(s): %s", len(booted_devices), list(booted_devices.keys()))
+        log.info("[EDL-TRACE] scan_all: total currently_connected: %s", sorted(currently_connected))
         return currently_connected, devices_info

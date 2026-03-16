@@ -41,6 +41,7 @@ STATUS_COLORS = {
     "debug":    Colors.USER_MODE,
     "user":     Colors.USER_MODE,
     "ready":    Colors.TEXT_SECONDARY,
+    "rebooting": Colors.TEXT_SECONDARY,
     "flashing": Colors.WARNING,
     "success":  Colors.SUCCESS,
     "failed":   Colors.ERROR,

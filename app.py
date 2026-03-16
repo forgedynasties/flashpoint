@@ -252,13 +252,20 @@ class FlashStation(QMainWindow):
 
     def scan(self):
         currently_connected, devices_info = DeviceScanner.scan_all()
+        log.info("[EDL-TRACE] scan: self.devices keys: %s", sorted(self.devices.keys()))
+        log.info("[EDL-TRACE] scan: edl_pending: %s", self.edl_pending)
+        log.info("[EDL-TRACE] scan: central_widget enabled: %s", self.central_widget.isEnabled())
 
         for usb_path in currently_connected:
             info = devices_info[usb_path]
             serial = info.get("serial", usb_path)
 
             if usb_path not in self.devices:
+                log.info("[EDL-TRACE] scan: NEW device at %s (serial=%r), calling add_device_row", usb_path, serial)
                 self.add_device_row(usb_path, serial)
+                log.info("[EDL-TRACE] scan: add_device_row done, table rows now: %d", self.table.rowCount())
+            else:
+                log.info("[EDL-TRACE] scan: existing device at %s (serial=%r)", usb_path, serial)
 
             device_info = self.devices[usb_path]
 
@@ -269,6 +276,7 @@ class FlashStation(QMainWindow):
 
             if "edl" in mode:
                 status = "edl"
+                log.info("[EDL-TRACE] scan: %s is EDL mode (was in edl_pending: %s)", usb_path, usb_path in self.edl_pending)
                 if usb_path in self.edl_pending:
                     self.edl_pending.discard(usb_path)
                     self._update_ui_lock()
@@ -290,7 +298,22 @@ class FlashStation(QMainWindow):
 
         for usb_path in list(self.devices.keys()):
             if usb_path not in currently_connected:
-                if not self.device_processes.get(usb_path, {}).get("is_flashing", False):
+                is_flashing = self.device_processes.get(usb_path, {}).get("is_flashing", False)
+                in_edl_pending = usb_path in self.edl_pending
+                if is_flashing or in_edl_pending:
+                    # Keep the row: either actively flashing or waiting for EDL to appear.
+                    # Show "rebooting" so the user knows we're waiting.
+                    if in_edl_pending:
+                        device_info = self.devices[usb_path]
+                        device_info["status_item"].setText("rebooting")
+                        device_info["status_item"].setForeground(
+                            QColor(STATUS_COLORS.get("rebooting", Colors.TEXT_SECONDARY))
+                        )
+                        device_info["adb_item"].setText("off")
+                        device_info["adb_item"].setForeground(QColor(Colors.TEXT_DIM))
+                        device_info["btn_edl"].setVisible(False)
+                        device_info["btn_flash"].setEnabled(False)
+                else:
                     self.remove_device(usb_path)
 
         self._update_selection_label()
