@@ -215,6 +215,13 @@ class FlashStation(QMainWindow):
             log.warning("Could not start qdl list-server: %s", exc)
             self._list_server_proc = None
 
+    def _ensure_list_server(self):
+        """Restart the qdl list-server if it has crashed."""
+        proc = getattr(self, '_list_server_proc', None)
+        if proc is not None and proc.poll() is not None:
+            log.warning("qdl list-server exited (rc=%d), restarting", proc.returncode)
+            self._start_list_server()
+
     def closeEvent(self, event):
         if getattr(self, '_list_server_proc', None):
             log.info("Stopping qdl list-server (pid=%d)", self._list_server_proc.pid)
@@ -251,6 +258,7 @@ class FlashStation(QMainWindow):
     # ------------------------------------------------------------------
 
     def scan(self):
+        self._ensure_list_server()
         currently_connected, devices_info = DeviceScanner.scan_all()
         log.info("[EDL-TRACE] scan: self.devices keys: %s", sorted(self.devices.keys()))
         log.info("[EDL-TRACE] scan: edl_pending: %s", self.edl_pending)

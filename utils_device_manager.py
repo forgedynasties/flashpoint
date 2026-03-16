@@ -18,6 +18,7 @@ _BOOTED_PID_MODE = {
     "18d1:4ee1": "USER BOOTED",
     "18d1:4e11": "DEBUG BOOTED",
     "05c6:901f": "DEBUG BOOTED",
+    "05c6:9008": "EDL",
 }
 
 
