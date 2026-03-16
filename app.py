@@ -32,6 +32,9 @@ COL_LOGS     = 7
 COL_ACTIONS  = 8
 COL_COUNT    = 9
 
+# UserRole data key stored in COL_SERIAL items to retrieve usb_path from a row
+_USB_PATH_ROLE = Qt.ItemDataRole.UserRole
+
 
 class CheckboxHeader(QHeaderView):
     """Header view that draws a real checkbox indicator in column 0."""
@@ -80,10 +83,13 @@ class FlashStation(QMainWindow):
         self.setMinimumSize(1000, 600)
         self.setGeometry(100, 100, 1200, 700)
 
+        # All dicts keyed by usb_path (e.g. "3-9.4.2") — stable physical port identifier.
+        # Serial numbers are stored inside each entry but never used as a key, since
+        # multiple devices can share the same serial (e.g. "androidboot.baseband=msm").
         self.devices = {}
-        self.adb_transports = {}
+        self.adb_transports = {}   # usb_path -> transport_id; refreshed every scan
         self.device_processes = {}
-        self.edl_pending = set()
+        self.edl_pending = set()   # set of usb_paths pending EDL transition
 
         self.setup_ui()
         self.setup_scanning()
@@ -247,22 +253,24 @@ class FlashStation(QMainWindow):
     def scan(self):
         currently_connected, devices_info = DeviceScanner.scan_all()
 
-        for serial in currently_connected:
-            if serial not in self.devices:
-                self.add_device_row(serial)
+        for usb_path in currently_connected:
+            info = devices_info[usb_path]
+            serial = info.get("serial", usb_path)
 
-            info = devices_info[serial]
-            device_info = self.devices[serial]
+            if usb_path not in self.devices:
+                self.add_device_row(usb_path, serial)
+
+            device_info = self.devices[usb_path]
 
             mode = info["mode"].lower()
             has_adb = info.get("has_adb", False)
             build_id = info.get("build_id", "")
-            usb_path = info.get("path") or ""
+            path_display = info.get("path") or usb_path
 
             if "edl" in mode:
                 status = "edl"
-                if serial in self.edl_pending:
-                    self.edl_pending.discard(serial)
+                if usb_path in self.edl_pending:
+                    self.edl_pending.discard(usb_path)
                     self._update_ui_lock()
             elif "debug" in mode:
                 status = "debug"
@@ -271,15 +279,19 @@ class FlashStation(QMainWindow):
             else:
                 status = "ready"
 
-            self.update_device_status(device_info, status, has_adb, build_id, usb_path)
+            self.update_device_status(device_info, status, has_adb, build_id, path_display)
 
+            # Refresh transport ID — it changes after every reconnect so we never cache
+            # it across scans; always use the value from the most recent scan.
             if "adb_tid" in info:
-                self.adb_transports[serial] = info["adb_tid"]
+                self.adb_transports[usb_path] = info["adb_tid"]
+            else:
+                self.adb_transports.pop(usb_path, None)
 
-        for serial in list(self.devices.keys()):
-            if serial not in currently_connected:
-                if not self.device_processes.get(serial, {}).get("is_flashing", False):
-                    self.remove_device(serial)
+        for usb_path in list(self.devices.keys()):
+            if usb_path not in currently_connected:
+                if not self.device_processes.get(usb_path, {}).get("is_flashing", False):
+                    self.remove_device(usb_path)
 
         self._update_selection_label()
 
@@ -287,7 +299,7 @@ class FlashStation(QMainWindow):
     # Row management
     # ------------------------------------------------------------------
 
-    def add_device_row(self, serial):
+    def add_device_row(self, usb_path, serial):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
@@ -301,12 +313,13 @@ class FlashStation(QMainWindow):
         chk_layout.addWidget(chk)
         chk_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         chk_layout.setContentsMargins(0, 0, 0, 0)
-        chk.clicked.connect(lambda checked, s=serial: self._on_checkbox_clicked(s, checked))
+        chk.clicked.connect(lambda checked, p=usb_path: self._on_checkbox_clicked(p, checked))
         self.table.setCellWidget(row, COL_CHECK, chk_widget)
 
-        # Serial
+        # Serial — displays the device serial; usb_path stored in UserRole for row lookups
         serial_item = QTableWidgetItem(serial)
         serial_item.setFlags(serial_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        serial_item.setData(_USB_PATH_ROLE, usb_path)
         self.table.setItem(row, COL_SERIAL, serial_item)
 
         # Status
@@ -360,20 +373,21 @@ class FlashStation(QMainWindow):
         btn_flash.setMinimumWidth(52)
         btn_flash.setSizePolicy(_exp)
         btn_flash.setStyleSheet(Styles.get_action_button_style(Colors.PRIMARY))
-        btn_flash.clicked.connect(lambda: self.handle_manual_flash(serial))
+        btn_flash.clicked.connect(lambda: self.handle_manual_flash(usb_path))
 
         btn_edl = QPushButton("EDL")
         btn_edl.setMinimumWidth(46)
         btn_edl.setSizePolicy(_exp)
         btn_edl.setStyleSheet(Styles.get_outlined_button_style(Colors.EDL_MODE))
-        btn_edl.clicked.connect(lambda: self.handle_edl_reboot(serial))
+        btn_edl.clicked.connect(lambda: self.handle_edl_reboot(usb_path))
         btn_edl.hide()
 
         action_layout.addWidget(btn_flash)
         action_layout.addWidget(btn_edl)
         self.table.setCellWidget(row, COL_ACTIONS, action_widget)
 
-        self.devices[serial] = {
+        self.devices[usb_path] = {
+            "serial": serial,
             "row": row,
             "chk": chk,
             "status_item": status_item,
@@ -387,7 +401,7 @@ class FlashStation(QMainWindow):
             "is_flashing": False,
         }
 
-        self.device_processes[serial] = {
+        self.device_processes[usb_path] = {
             "process": None,
             "is_flashing": False,
         }
@@ -424,20 +438,24 @@ class FlashStation(QMainWindow):
         device_info["btn_edl"].setVisible(has_adb)
         device_info["btn_flash"].setEnabled(status == "edl")
 
-    def remove_device(self, serial):
-        if serial in self.devices:
-            device_info = self.devices.pop(serial)
+    def remove_device(self, usb_path):
+        if usb_path in self.devices:
+            device_info = self.devices.pop(usb_path)
             row = device_info["row"]
             self.table.removeRow(row)
 
+            # After removeRow, all rows above the removed row shift down by 1.
+            # Re-index by reading usb_path back from each remaining row's UserRole data.
             for i in range(row, self.table.rowCount()):
                 item = self.table.item(i, COL_SERIAL)
-                if item and item.text() in self.devices:
-                    self.devices[item.text()]["row"] = i
+                if item:
+                    path = item.data(_USB_PATH_ROLE)
+                    if path and path in self.devices:
+                        self.devices[path]["row"] = i
 
-            self.adb_transports.pop(serial, None)
-            self.device_processes.pop(serial, None)
-            self.edl_pending.discard(serial)
+            self.adb_transports.pop(usb_path, None)
+            self.device_processes.pop(usb_path, None)
+            self.edl_pending.discard(usb_path)
             self._update_ui_lock()
             self._update_selection_label()
 
@@ -445,43 +463,42 @@ class FlashStation(QMainWindow):
     # Selection helpers
     # ------------------------------------------------------------------
 
-    def _checked_serials(self):
-        return [s for s, d in self.devices.items() if d["chk"].isChecked()]
+    def _checked_usb_paths(self):
+        return [p for p, d in self.devices.items() if d["chk"].isChecked()]
 
     def _update_selection_label(self):
         total = len(self.devices)
-        checked = len(self._checked_serials())
+        checked = len(self._checked_usb_paths())
         self.lbl_selected.setText(f"{checked} / {total} selected")
-        edl_devices = [s for s, d in self.devices.items() if d["status_item"].text() == "edl"]
-        all_edl_checked = bool(edl_devices) and all(self.devices[s]["chk"].isChecked() for s in edl_devices)
+        edl_devices = [p for p, d in self.devices.items() if d["status_item"].text() == "edl"]
+        all_edl_checked = bool(edl_devices) and all(self.devices[p]["chk"].isChecked() for p in edl_devices)
         self.check_header.set_check_state(all_edl_checked)
 
     def _toggle_select_all(self, section):
         if section != COL_CHECK:
             return
-        edl_devices = [s for s, d in self.devices.items() if d["status_item"].text() == "edl"]
-        all_checked = bool(edl_devices) and all(self.devices[s]["chk"].isChecked() for s in edl_devices)
+        edl_devices = [p for p, d in self.devices.items() if d["status_item"].text() == "edl"]
+        all_checked = bool(edl_devices) and all(self.devices[p]["chk"].isChecked() for p in edl_devices)
         selecting = not all_checked
-        for s, d in self.devices.items():
+        for p, d in self.devices.items():
             chk = d["chk"]
             chk.setChecked(False if not selecting else d["status_item"].text() == "edl")
         self._update_selection_label()
         if selecting:
             non_edl_adb = [
-                s for s, d in self.devices.items()
+                p for p, d in self.devices.items()
                 if d["status_item"].text() != "edl" and d["adb_item"].text() == "on"
             ]
             if non_edl_adb:
                 self._show_edl_warning_multi(non_edl_adb)
 
-    def _on_checkbox_clicked(self, serial, checked):
-        if serial not in self.devices:
+    def _on_checkbox_clicked(self, usb_path, checked):
+        if usb_path not in self.devices:
             return
-        device_info = self.devices[serial]
+        device_info = self.devices[usb_path]
         if checked and device_info["status_item"].text() != "edl":
-            # clicked signal fires after full click, so setChecked here is safe — no re-entrancy
             device_info["chk"].setChecked(False)
-            self._show_edl_warning(serial)
+            self._show_edl_warning(usb_path)
             return
         self._update_selection_label()
 
@@ -518,16 +535,17 @@ class FlashStation(QMainWindow):
         """)
         return msg
 
-    def _show_edl_warning(self, serial):
-        if serial not in self.devices:
+    def _show_edl_warning(self, usb_path):
+        if usb_path not in self.devices:
             return
-        device_info = self.devices[serial]
+        device_info = self.devices[usb_path]
+        serial = device_info["serial"]
         has_adb = device_info["adb_item"].text() == "on"
 
         msg = self._make_dialog()
         msg.setWindowTitle("Device Not in EDL")
         msg.setText(
-            f"Device <b>{serial}</b> is not in EDL mode.<br><br>"
+            f"Device <b>{serial}</b> ({usb_path}) is not in EDL mode.<br><br>"
             "Only devices in EDL mode can be selected for flashing."
         )
         if has_adb:
@@ -536,41 +554,41 @@ class FlashStation(QMainWindow):
             msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
             msg.exec()
             if msg.clickedButton() == btn_reboot:
-                self.handle_edl_reboot(serial)
+                self.handle_edl_reboot(usb_path)
         else:
             msg.setInformativeText("Connect the device via ADB first to reboot it to EDL mode.")
             msg.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
             msg.exec()
 
-    def _show_edl_warning_multi(self, serials):
+    def _show_edl_warning_multi(self, usb_paths):
         msg = self._make_dialog()
         msg.setWindowTitle("Devices Not in EDL")
         msg.setText(
-            f"{len(serials)} device(s) are not in EDL mode and were not selected."
+            f"{len(usb_paths)} device(s) are not in EDL mode and were not selected."
         )
         msg.setInformativeText("Would you like to reboot them all to EDL mode now?")
         btn_reboot = msg.addButton("Reboot All to EDL", QMessageBox.ButtonRole.AcceptRole)
         msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         msg.exec()
         if msg.clickedButton() == btn_reboot:
-            for serial in serials:
-                self.handle_edl_reboot(serial)
+            for usb_path in usb_paths:
+                self.handle_edl_reboot(usb_path)
 
     # ------------------------------------------------------------------
     # EDL reboot
     # ------------------------------------------------------------------
 
-    def handle_edl_reboot(self, serial):
-        if serial in self.adb_transports:
-            RebootManager.reboot_to_edl(self.adb_transports[serial])
-            self.edl_pending.add(serial)
+    def handle_edl_reboot(self, usb_path):
+        if usb_path in self.adb_transports:
+            RebootManager.reboot_to_edl(self.adb_transports[usb_path])
+            self.edl_pending.add(usb_path)
             self._update_ui_lock()
 
     def reboot_all_to_edl(self):
-        for serial in list(self.devices.keys()):
-            if serial in self.adb_transports:
-                if self.devices[serial]["btn_edl"].isVisible():
-                    self.handle_edl_reboot(serial)
+        for usb_path in list(self.devices.keys()):
+            if usb_path in self.adb_transports:
+                if self.devices[usb_path]["btn_edl"].isVisible():
+                    self.handle_edl_reboot(usb_path)
 
     # ------------------------------------------------------------------
     # UI lock
@@ -586,7 +604,7 @@ class FlashStation(QMainWindow):
     # Flashing
     # ------------------------------------------------------------------
 
-    def handle_manual_flash(self, serial):
+    def handle_manual_flash(self, usb_path):
         fw_path = self.fw_combo.currentText()
         if not os.path.isdir(fw_path):
             QMessageBox.warning(self, "Invalid Path", "Please select a valid firmware folder.")
@@ -594,7 +612,7 @@ class FlashStation(QMainWindow):
 
         prog, raw, patch = FlashManager.find_firmware_files(fw_path)
         if prog and raw and patch:
-            self.start_flash(serial, prog, raw, patch)
+            self.start_flash(usb_path, prog, raw, patch)
         else:
             QMessageBox.warning(
                 self,
@@ -603,7 +621,7 @@ class FlashStation(QMainWindow):
             )
 
     def flash_all_ready(self):
-        selected = self._checked_serials()
+        selected = self._checked_usb_paths()
 
         if not selected:
             QMessageBox.warning(
@@ -614,9 +632,9 @@ class FlashStation(QMainWindow):
 
         # Only flash selected devices that are in EDL mode and not already flashing
         targets = [
-            s for s in selected
-            if self.devices[s]["status_item"].text() == "edl"
-            and not self.devices[s]["is_flashing"]
+            p for p in selected
+            if self.devices[p]["status_item"].text() == "edl"
+            and not self.devices[p]["is_flashing"]
         ]
 
         if not targets:
@@ -626,7 +644,7 @@ class FlashStation(QMainWindow):
             )
             return
 
-        serial_list = "\n".join(f"  • {s}" for s in targets)
+        serial_list = "\n".join(f"  • {self.devices[p]['serial']} ({p})" for p in targets)
         reply = QMessageBox.question(
             self, "Confirm Flash",
             f"Flash {len(targets)} device(s)?\n\n{serial_list}",
@@ -634,15 +652,16 @@ class FlashStation(QMainWindow):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            for serial in targets:
-                self.handle_manual_flash(serial)
+            for usb_path in targets:
+                self.handle_manual_flash(usb_path)
 
-    def start_flash(self, serial, prog, raw, patch):
-        if serial not in self.devices or serial not in self.device_processes:
+    def start_flash(self, usb_path, prog, raw, patch):
+        if usb_path not in self.devices or usb_path not in self.device_processes:
             return
 
-        device_info = self.devices[serial]
-        process_info = self.device_processes[serial]
+        device_info = self.devices[usb_path]
+        process_info = self.device_processes[usb_path]
+        serial = device_info["serial"]
 
         if process_info["is_flashing"]:
             return
@@ -658,13 +677,13 @@ class FlashStation(QMainWindow):
         device_info["log_box"].setText("")
         self._update_ui_lock()
 
-        # Progress socket server — GUI listens, qdl connects as client
-        sock_name = f"{QDL_PROGRESS_SOCK_PREFIX}{serial}"
+        # Progress socket — named by usb_path (safe chars: digits, dashes, dots)
+        sock_name = f"{QDL_PROGRESS_SOCK_PREFIX}{usb_path}"
         QLocalServer.removeServer(sock_name)
         progress_server = QLocalServer()
         progress_server.listen(sock_name)
         progress_sock_path = progress_server.fullServerName()
-        log.debug("Progress server for %s at %s", serial, progress_sock_path)
+        log.debug("Progress server for %s at %s", usb_path, progress_sock_path)
 
         process = QProcess()
         process_info["process"] = process
@@ -676,7 +695,7 @@ class FlashStation(QMainWindow):
             if not sock:
                 return
             process_info["progress_socket"] = sock
-            log.debug("Progress socket connected for %s", serial)
+            log.debug("Progress socket connected for %s", usb_path)
             sock.readyRead.connect(lambda: _read_progress(sock))
 
         def _read_progress(sock):
@@ -698,19 +717,19 @@ class FlashStation(QMainWindow):
                             msg.get("message", "").strip())
                         log.log(
                             logging.WARNING if event == "error" else logging.DEBUG,
-                            "qdl [%s] %s: %s", serial, event,
+                            "qdl [%s] %s: %s", usb_path, event,
                             msg.get("message", ""))
                 except (json.JSONDecodeError, KeyError):
                     device_info["log_box"].setText(line)
 
-        # Drain stdout to prevent pipe blocking (qdl also writes --json to stdout)
+        # Drain stdout to prevent pipe blocking
         process.readyReadStandardOutput.connect(
-            lambda: log.debug("qdl stdout [%s]: %s", serial,
+            lambda: log.debug("qdl stdout [%s]: %s", usb_path,
                               process.readAllStandardOutput().data()
                               .decode(errors='replace').strip()))
 
         def handle_finished(exit_code):
-            log.info("qdl finished for %s with exit code %d", serial, exit_code)
+            log.info("qdl finished for %s (%s) with exit code %d", usb_path, serial, exit_code)
             if process_info.get("progress_socket"):
                 process_info["progress_socket"].close()
             progress_server.close()
@@ -741,7 +760,7 @@ class FlashStation(QMainWindow):
         firmware_dir = FlashManager.get_working_directory(raw)
         args = FlashManager.build_flash_command(serial, prog, raw, patch,
                                                 progress_socket=progress_sock_path)
-        log.info("Starting flash for %s: %s", serial, " ".join(args))
+        log.info("Starting flash for %s (%s): %s", usb_path, serial, " ".join(args))
         process.setWorkingDirectory(firmware_dir)
         process.start(args[0], args[1:])
 

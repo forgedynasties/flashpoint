@@ -60,17 +60,23 @@ class DeviceScanner:
 
     @staticmethod
     def get_edl_devices(list_socket=QDL_LIST_SOCKET):
-        """Return {serial: usb_path} for EDL devices via the qdl list-server."""
+        """Return {usb_path: {serial, usb_path}} for EDL devices via the qdl list-server.
+
+        Keyed by usb_path so duplicate serials don't collide.
+        """
         device_list = DeviceScanner._query_list_socket(list_socket)
         if device_list is None:
             log.warning("No EDL devices returned (list-server unavailable)")
             return {}
         devices = {}
         for dev in device_list:
-            serial = dev.get("serial", "").strip()
-            if serial:
-                devices[serial] = dev.get("usb_path") or None
-                log.debug("EDL device: serial=%s path=%s", serial, devices[serial])
+            path = (dev.get("usb_path") or "").strip()
+            serial = (dev.get("serial") or "").strip()
+            key = path or serial  # path is preferred; fall back to serial if qdl omits it
+            if not key:
+                continue
+            devices[key] = {"serial": serial, "usb_path": path or None}
+            log.debug("EDL device: serial=%s path=%s", serial, path)
         return devices
 
     # ------------------------------------------------------------------
@@ -100,7 +106,11 @@ class DeviceScanner:
 
     @staticmethod
     def get_adb_transport_map():
-        """Map USB paths to ADB transport IDs."""
+        """Map USB paths to ADB transport IDs.
+
+        Returns {usb_path: transport_id}. Always called fresh — transport IDs
+        change after every device reconnect so they must never be cached long-term.
+        """
         usb_to_tid = {}
         try:
             adb_out = subprocess.check_output(["adb", "devices", "-l"]).decode()
@@ -130,28 +140,33 @@ class DeviceScanner:
 
     @staticmethod
     def get_booted_devices():
-        """Scan for booted devices (USER/DEBUG modes) via pyudev."""
+        """Scan for booted devices (USER/DEBUG modes) via pyudev.
+
+        Returns {usb_path: {serial, mode, has_adb, path, [adb_tid]}}.
+        Keyed by usb_path (sysfs sys_name) so duplicate serials don't collide.
+        """
         devices = {}
         usb_to_tid = DeviceScanner.get_adb_transport_map()
 
         for vidpid, mode in _BOOTED_PID_MODE.items():
             vid, pid = vidpid.split(':')
             for device in DeviceScanner._usb_devices(vid, pid):
-                hw_sn = DeviceScanner._serial_from_device(device)
-                if not hw_sn:
-                    log.debug("Skipping booted device with no serial (vid=%s pid=%s)", vid, pid)
+                path = device.sys_name  # e.g. "3-9.4.2" — stable physical port identifier
+                if not path:
+                    log.debug("Skipping booted device with no path (vid=%s pid=%s)", vid, pid)
                     continue
 
-                path = device.sys_name
+                hw_sn = DeviceScanner._serial_from_device(device) or path
                 has_adb = (vidpid in ("18d1:4e11", "05c6:901f") or path in usb_to_tid)
 
-                devices[hw_sn] = {
+                devices[path] = {
+                    "serial": hw_sn,
                     "mode": mode,
                     "has_adb": has_adb,
                     "path": path,
                 }
                 if has_adb and path in usb_to_tid:
-                    devices[hw_sn]["adb_tid"] = usb_to_tid[path]
+                    devices[path]["adb_tid"] = usb_to_tid[path]
 
                 log.debug("Booted device: serial=%s mode=%s path=%s adb=%s",
                           hw_sn, mode, path, has_adb)
@@ -164,23 +179,32 @@ class DeviceScanner:
 
     @staticmethod
     def scan_all(list_socket=QDL_LIST_SOCKET):
-        """Complete device scan. Returns (set_of_serials, devices_info_dict)."""
+        """Complete device scan.
+
+        Returns (set_of_usb_paths, devices_info_dict) where devices_info_dict
+        is keyed by usb_path and each entry contains at least a 'serial' field.
+        """
         currently_connected = set()
         devices_info = {}
 
         edl_devices = DeviceScanner.get_edl_devices(list_socket)
-        for serial, path in edl_devices.items():
-            currently_connected.add(serial)
-            devices_info[serial] = {"mode": "EDL", "has_adb": False, "path": path}
+        for path, info in edl_devices.items():
+            currently_connected.add(path)
+            devices_info[path] = {
+                "mode": "EDL",
+                "has_adb": False,
+                "path": path,
+                "serial": info.get("serial", ""),
+            }
 
         booted_devices = DeviceScanner.get_booted_devices()
-        for serial, info in booted_devices.items():
-            currently_connected.add(serial)
-            devices_info[serial] = info
+        for path, info in booted_devices.items():
+            currently_connected.add(path)
+            devices_info[path] = info
             if info.get("has_adb") and "adb_tid" in info:
                 build_id = DeviceScanner.get_build_id(info["adb_tid"])
                 if build_id:
-                    devices_info[serial]["build_id"] = build_id
+                    devices_info[path]["build_id"] = build_id
 
         log.debug("scan_all: %d device(s) connected", len(currently_connected))
         return currently_connected, devices_info
