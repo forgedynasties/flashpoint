@@ -11,6 +11,7 @@ const char *__progname = "ramdump";
 #endif
 
 bool qdl_debug;
+bool qdl_json_output;
 
 static void print_usage(FILE *out)
 {

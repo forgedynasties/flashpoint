@@ -41,6 +41,7 @@ enum {
 };
 
 bool qdl_debug;
+bool qdl_json_output;
 
 static int detect_type(const char *verb)
 {
@@ -429,6 +430,7 @@ static void print_usage(FILE *out)
 	fprintf(out, "       %s list\n", __progname);
 	fprintf(out, "       %s ramdump [--debug] [-o <ramdump-path>] [<segment-filter>,...]\n", __progname);
 	fprintf(out, " -d, --debug\t\t\tPrint detailed debug info\n");
+	fprintf(out, " -j, --json\t\t\tOutput progress as JSON lines on stdout\n");
 	fprintf(out, " -v, --version\t\t\tPrint the current version and exit\n");
 	fprintf(out, " -n, --dry-run\t\t\tDry run execution, no device reading or flashing\n");
 	fprintf(out, " -f, --allow-missing\t\tAllow skipping of missing files during flashing\n");
@@ -575,6 +577,7 @@ static int qdl_flash(int argc, char **argv)
 	static struct option options[] = {
 		{"debug", no_argument, 0, 'd'},
 		{"version", no_argument, 0, 'v'},
+		{"json", no_argument, 0, 'j'},
 		{"include", required_argument, 0, 'i'},
 		{"finalize-provisioning", no_argument, 0, 'l'},
 		{"out-chunk-size", required_argument, 0, 'u' },
@@ -590,10 +593,13 @@ static int qdl_flash(int argc, char **argv)
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:h", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvji:lu:S:D:s:fcnt:T:h", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
+			break;
+		case 'j':
+			qdl_json_output = true;
 			break;
 		case 'n':
 			qdl_dev_type = QDL_DEVICE_SIM;

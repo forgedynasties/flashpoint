@@ -1,6 +1,6 @@
 """Main application window for the flash station."""
 import os
-import re
+import json
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
     QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QProgressBar,
@@ -640,11 +640,19 @@ class FlashStation(QMainWindow):
             data = process.readAllStandardOutput().data().decode()
             for line in data.splitlines():
                 stripped = line.strip()
-                if stripped:
+                if not stripped:
+                    continue
+                try:
+                    msg = json.loads(stripped)
+                    event = msg.get("event")
+                    if event == "progress":
+                        pct = min(int(msg["percent"]), 100)
+                        device_info["progress"].setValue(pct)
+                        device_info["log_box"].setText(f'{msg["task"]} {msg["percent"]:.1f}%')
+                    elif event in ("info", "error"):
+                        device_info["log_box"].setText(msg.get("message", "").strip())
+                except (json.JSONDecodeError, KeyError):
                     device_info["log_box"].setText(stripped)
-                    match = re.search(r"(\d+\.\d+)%", line)
-                    if match:
-                        device_info["progress"].setValue(min(int(float(match.group(1))), 100))
 
         def handle_finished(exit_code):
             process_info["is_flashing"] = False

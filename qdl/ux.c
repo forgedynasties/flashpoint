@@ -31,6 +31,20 @@ static unsigned int ux_cur_line_length;
  * debug: protocol logs
  */
 
+/* Emit a JSON-escaped string (without surrounding quotes) to stdout */
+static void print_json_str(const char *s)
+{
+	for (; *s; s++) {
+		switch (*s) {
+		case '"':  fputs("\\\"", stdout); break;
+		case '\\': fputs("\\\\", stdout); break;
+		case '\n': fputs("\\n",  stdout); break;
+		case '\r': break;
+		default:   putchar(*s); break;
+		}
+	}
+}
+
 /* Clear ux_cur_line_length characters of the progress bar from the screen */
 static void ux_clear_line(void)
 {
@@ -73,26 +87,46 @@ void ux_init(void)
 
 void ux_err(const char *fmt, ...)
 {
+	char buf[512];
 	va_list ap;
 
 	ux_clear_line();
 
 	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-	fflush(stderr);
+	if (qdl_json_output) {
+		vsnprintf(buf, sizeof(buf), fmt, ap);
+		va_end(ap);
+		printf("{\"event\":\"error\",\"message\":\"");
+		print_json_str(buf);
+		printf("\"}\n");
+		fflush(stdout);
+	} else {
+		vfprintf(stderr, fmt, ap);
+		va_end(ap);
+		fflush(stderr);
+	}
 }
 
 void ux_info(const char *fmt, ...)
 {
+	char buf[512];
 	va_list ap;
 
 	ux_clear_line();
 
 	va_start(ap, fmt);
-	vprintf(fmt, ap);
-	va_end(ap);
-	fflush(stdout);
+	if (qdl_json_output) {
+		vsnprintf(buf, sizeof(buf), fmt, ap);
+		va_end(ap);
+		printf("{\"event\":\"info\",\"message\":\"");
+		print_json_str(buf);
+		printf("\"}\n");
+		fflush(stdout);
+	} else {
+		vprintf(fmt, ap);
+		va_end(ap);
+		fflush(stdout);
+	}
 }
 
 void ux_log(const char *fmt, ...)
@@ -153,8 +187,15 @@ void ux_progress(const char *fmt, unsigned int value, unsigned int max, ...)
 
 	percent = (float)value / max;
 
-	fprintf(stderr, "%s %1.2f%%\r", task_name, percent * 100);
-	fflush(stderr);
+	if (qdl_json_output) {
+		printf("{\"event\":\"progress\",\"task\":\"");
+		print_json_str(task_name);
+		printf("\",\"percent\":%.2f}\n", percent * 100);
+		fflush(stdout);
+	} else {
+		fprintf(stderr, "%s %1.2f%%\r", task_name, percent * 100);
+		fflush(stderr);
+	}
 
 	gettimeofday(&last_progress_update, NULL);
 }

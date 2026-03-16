@@ -23,6 +23,7 @@ const char *__progname = "ks";
 static struct qdl_device qdl;
 
 bool qdl_debug;
+bool qdl_json_output;
 
 int qdl_read(struct qdl_device *qdl, void *buf, size_t len, unsigned int timeout __unused)
 {

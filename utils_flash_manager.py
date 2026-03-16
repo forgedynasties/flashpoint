@@ -55,6 +55,7 @@ class FlashManager:
         return [
             "sudo",
             QDL_BIN,
+            "--json",
             "-S",
             serial,
             "-s",

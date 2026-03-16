@@ -133,5 +133,6 @@ int parse_storage_address(const char *address, int *physical_partition,
 			  char **gpt_partition);
 
 extern bool qdl_debug;
+extern bool qdl_json_output;
 
 #endif

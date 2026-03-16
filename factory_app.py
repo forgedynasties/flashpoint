@@ -1,6 +1,6 @@
 """Factory Assembly Flash Station — automated 3-stage flashing pipeline."""
 import os
-import re
+import json
 from datetime import datetime, timezone
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -412,10 +412,17 @@ class FactoryStation(QMainWindow):
                 stripped = line.strip()
                 if not stripped:
                     continue
-                dev["log_lbl"].setText(stripped)
-                m = re.search(r"(\d+\.\d+)%", stripped)
-                if m:
-                    dev["progress"].setValue(min(int(float(m.group(1))), 100))
+                try:
+                    msg = json.loads(stripped)
+                    event = msg.get("event")
+                    if event == "progress":
+                        pct = min(int(msg["percent"]), 100)
+                        dev["progress"].setValue(pct)
+                        dev["log_lbl"].setText(f'{msg["task"]} {msg["percent"]:.1f}%')
+                    elif event in ("info", "error"):
+                        dev["log_lbl"].setText(msg.get("message", "").strip())
+                except (json.JSONDecodeError, KeyError):
+                    dev["log_lbl"].setText(stripped)
 
         def on_finished(code):
             dev["process"] = None
