@@ -15,6 +15,10 @@
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 
 #include "qdl.h"
 #include "patch.h"
@@ -431,6 +435,7 @@ static void print_usage(FILE *out)
 	fprintf(out, "       %s ramdump [--debug] [-o <ramdump-path>] [<segment-filter>,...]\n", __progname);
 	fprintf(out, " -d, --debug\t\t\tPrint detailed debug info\n");
 	fprintf(out, " -j, --json\t\t\tOutput progress as JSON lines on stdout\n");
+	fprintf(out, " -P, --progress-socket=PATH\tConnect to PATH socket for JSON progress events\n");
 	fprintf(out, " -v, --version\t\t\tPrint the current version and exit\n");
 	fprintf(out, " -n, --dry-run\t\t\tDry run execution, no device reading or flashing\n");
 	fprintf(out, " -f, --allow-missing\t\tAllow skipping of missing files during flashing\n");
@@ -475,6 +480,82 @@ static int qdl_list(FILE *out)
 
 	free(devices);
 
+	return 0;
+}
+
+#define QDL_LIST_SOCKET_DEFAULT "/tmp/qdl-list.sock"
+#define QDL_LIST_BUF_SIZE 8192
+
+static int qdl_list_server_loop(const char *socket_path)
+{
+	struct qdl_device_desc *devices;
+	struct sockaddr_un addr;
+	char buf[QDL_LIST_BUF_SIZE];
+	int server_fd, client_fd;
+	unsigned int count;
+	int n, ret, i;
+
+	signal(SIGPIPE, SIG_IGN);
+
+	unlink(socket_path);
+	server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (server_fd < 0) {
+		perror("qdl list-server: socket");
+		return 1;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+	ret = bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));
+	if (ret < 0) {
+		perror("qdl list-server: bind");
+		close(server_fd);
+		return 1;
+	}
+
+	/* Allow non-root clients to connect */
+	chmod(socket_path, 0666);
+
+	ret = listen(server_fd, 8);
+	if (ret < 0) {
+		perror("qdl list-server: listen");
+		close(server_fd);
+		unlink(socket_path);
+		return 1;
+	}
+
+	fprintf(stderr, "qdl list-server: listening on %s\n", socket_path);
+
+	for (;;) {
+		client_fd = accept(server_fd, NULL, NULL);
+		if (client_fd < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("qdl list-server: accept");
+			break;
+		}
+
+		devices = usb_list(&count);
+		n = snprintf(buf, sizeof(buf), "[");
+		for (i = 0; i < (int)count; i++) {
+			n += snprintf(buf + n, sizeof(buf) - n,
+				      "%s{\"vid\":\"%04x\",\"pid\":\"%04x\","
+				      "\"serial\":\"%s\",\"usb_path\":\"%s\"}",
+				      i > 0 ? "," : "",
+				      devices[i].vid, devices[i].pid,
+				      devices[i].serial, devices[i].usb_path);
+		}
+		n += snprintf(buf + n, sizeof(buf) - n, "]\n");
+		free(devices);
+
+		send(client_fd, buf, n, MSG_NOSIGNAL);
+		close(client_fd);
+	}
+
+	close(server_fd);
+	unlink(socket_path);
 	return 0;
 }
 
@@ -563,6 +644,7 @@ static int qdl_flash(int argc, char **argv)
 	char *serial = NULL;
 	const char *vip_generate_dir = NULL;
 	const char *vip_table_path = NULL;
+	char *qdl_progress_socket_path = NULL;
 	int type;
 	int ret;
 	int opt;
@@ -589,11 +671,12 @@ static int qdl_flash(int argc, char **argv)
 		{"dry-run", no_argument, 0, 'n'},
 		{"create-digests", required_argument, 0, 't'},
 		{"slot", required_argument, 0, 'T'},
+		{"progress-socket", required_argument, 0, 'P'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvji:lu:S:D:s:fcnt:T:h", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvji:lu:P:S:D:s:fcnt:T:h", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -639,6 +722,9 @@ static int qdl_flash(int argc, char **argv)
 		case 'T':
 			slot = (unsigned int)strtoul(optarg, NULL, 10);
 			break;
+		case 'P':
+			qdl_progress_socket_path = optarg;
+			break;
 		case 'h':
 			print_usage(stdout);
 			return 0;
@@ -652,6 +738,29 @@ static int qdl_flash(int argc, char **argv)
 	if ((optind + 2) > argc) {
 		print_usage(stderr);
 		return 1;
+	}
+
+	/* Connect to GUI progress socket if specified */
+	if (qdl_progress_socket_path) {
+		struct sockaddr_un p_addr;
+		int p_sock;
+
+		p_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (p_sock >= 0) {
+			memset(&p_addr, 0, sizeof(p_addr));
+			p_addr.sun_family = AF_UNIX;
+			strncpy(p_addr.sun_path, qdl_progress_socket_path,
+				sizeof(p_addr.sun_path) - 1);
+			if (connect(p_sock, (struct sockaddr *)&p_addr,
+				    sizeof(p_addr)) == 0) {
+				qdl_progress_sock_fd = p_sock;
+			} else {
+				fprintf(stderr,
+					"qdl: warning: could not connect to progress socket %s\n",
+					qdl_progress_socket_path);
+				close(p_sock);
+			}
+		}
 	}
 
 	qdl = qdl_init(qdl_dev_type);
@@ -774,6 +883,11 @@ out_cleanup:
 	if (qdl->vip_data.state != VIP_DISABLED)
 		vip_transfer_deinit(qdl);
 
+	if (qdl_progress_sock_fd >= 0) {
+		close(qdl_progress_sock_fd);
+		qdl_progress_sock_fd = -1;
+	}
+
 	qdl_deinit(qdl);
 
 	return !!ret;
@@ -785,6 +899,12 @@ int main(int argc, char **argv)
 		return qdl_list(stdout);
 	if (argc >= 2 && !strcmp(argv[1], "ramdump"))
 		return qdl_ramdump(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "list-server")) {
+		const char *socket_path = QDL_LIST_SOCKET_DEFAULT;
+		if (argc >= 4 && !strcmp(argv[2], "--socket"))
+			socket_path = argv[3];
+		return qdl_list_server_loop(socket_path);
+	}
 
 	return qdl_flash(argc, argv);
 }

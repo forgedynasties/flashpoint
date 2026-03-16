@@ -102,6 +102,7 @@ struct qdl_device_desc {
 	int vid;
 	int pid;
 	char serial[16];
+	char usb_path[32];
 };
 
 struct qdl_device_desc *usb_list(unsigned int *devices_found);
@@ -134,5 +135,6 @@ int parse_storage_address(const char *address, int *physical_partition,
 
 extern bool qdl_debug;
 extern bool qdl_json_output;
+extern int qdl_progress_sock_fd;
 
 #endif

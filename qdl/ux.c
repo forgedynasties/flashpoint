@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include <stdarg.h>
+#include <string.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -31,17 +32,45 @@ static unsigned int ux_cur_line_length;
  * debug: protocol logs
  */
 
-/* Emit a JSON-escaped string (without surrounding quotes) to stdout */
-static void print_json_str(const char *s)
+int qdl_progress_sock_fd = -1;
+
+/* Write s into out as a JSON-escaped C string (NUL-terminated, no surrounding quotes) */
+static void build_json_str(char *out, size_t out_size, const char *s)
 {
-	for (; *s; s++) {
+	size_t n = 0;
+
+	while (*s && n < out_size - 2) {
 		switch (*s) {
-		case '"':  fputs("\\\"", stdout); break;
-		case '\\': fputs("\\\\", stdout); break;
-		case '\n': fputs("\\n",  stdout); break;
-		case '\r': break;
-		default:   putchar(*s); break;
+		case '"':
+			if (n + 1 < out_size - 1) { out[n++] = '\\'; out[n++] = '"';  }
+			break;
+		case '\\':
+			if (n + 1 < out_size - 1) { out[n++] = '\\'; out[n++] = '\\'; }
+			break;
+		case '\n':
+			if (n + 1 < out_size - 1) { out[n++] = '\\'; out[n++] = 'n';  }
+			break;
+		case '\r':
+			break;
+		default:
+			out[n++] = *s;
+			break;
 		}
+		s++;
+	}
+	out[n] = '\0';
+}
+
+/* Emit a JSON line to stdout (when --json) and/or the progress socket */
+static void emit_json_line(const char *json)
+{
+	if (qdl_json_output) {
+		fputs(json, stdout);
+		fflush(stdout);
+	}
+	if (qdl_progress_sock_fd >= 0) {
+		ssize_t ret = write(qdl_progress_sock_fd, json, strlen(json));
+		(void)ret;
 	}
 }
 
@@ -87,44 +116,46 @@ void ux_init(void)
 
 void ux_err(const char *fmt, ...)
 {
-	char buf[512];
+	char msg[512], escaped[512], json[640];
 	va_list ap;
 
 	ux_clear_line();
 
 	va_start(ap, fmt);
-	if (qdl_json_output) {
-		vsnprintf(buf, sizeof(buf), fmt, ap);
-		va_end(ap);
-		printf("{\"event\":\"error\",\"message\":\"");
-		print_json_str(buf);
-		printf("\"}\n");
-		fflush(stdout);
-	} else {
-		vfprintf(stderr, fmt, ap);
-		va_end(ap);
+	vsnprintf(msg, sizeof(msg), fmt, ap);
+	va_end(ap);
+
+	if (qdl_json_output || qdl_progress_sock_fd >= 0) {
+		build_json_str(escaped, sizeof(escaped), msg);
+		snprintf(json, sizeof(json),
+			 "{\"event\":\"error\",\"message\":\"%s\"}\n", escaped);
+		emit_json_line(json);
+	}
+	if (!qdl_json_output) {
+		fputs(msg, stderr);
 		fflush(stderr);
 	}
 }
 
 void ux_info(const char *fmt, ...)
 {
-	char buf[512];
+	char msg[512], escaped[512], json[640];
 	va_list ap;
 
 	ux_clear_line();
 
 	va_start(ap, fmt);
-	if (qdl_json_output) {
-		vsnprintf(buf, sizeof(buf), fmt, ap);
-		va_end(ap);
-		printf("{\"event\":\"info\",\"message\":\"");
-		print_json_str(buf);
-		printf("\"}\n");
-		fflush(stdout);
-	} else {
-		vprintf(fmt, ap);
-		va_end(ap);
+	vsnprintf(msg, sizeof(msg), fmt, ap);
+	va_end(ap);
+
+	if (qdl_json_output || qdl_progress_sock_fd >= 0) {
+		build_json_str(escaped, sizeof(escaped), msg);
+		snprintf(json, sizeof(json),
+			 "{\"event\":\"info\",\"message\":\"%s\"}\n", escaped);
+		emit_json_line(json);
+	}
+	if (!qdl_json_output) {
+		fputs(msg, stdout);
 		fflush(stdout);
 	}
 }
@@ -162,9 +193,9 @@ void ux_debug(const char *fmt, ...)
 void ux_progress(const char *fmt, unsigned int value, unsigned int max, ...)
 {
 	static struct timeval last_progress_update;
+	char task_name[32], escaped_task[64], json[128];
 	unsigned long elapsed_us;
 	struct timeval now;
-	char task_name[32];
 	float percent;
 	va_list ap;
 
@@ -187,12 +218,14 @@ void ux_progress(const char *fmt, unsigned int value, unsigned int max, ...)
 
 	percent = (float)value / max;
 
-	if (qdl_json_output) {
-		printf("{\"event\":\"progress\",\"task\":\"");
-		print_json_str(task_name);
-		printf("\",\"percent\":%.2f}\n", percent * 100);
-		fflush(stdout);
-	} else {
+	if (qdl_json_output || qdl_progress_sock_fd >= 0) {
+		build_json_str(escaped_task, sizeof(escaped_task), task_name);
+		snprintf(json, sizeof(json),
+			 "{\"event\":\"progress\",\"task\":\"%s\",\"percent\":%.2f}\n",
+			 escaped_task, percent * 100);
+		emit_json_line(json);
+	}
+	if (!qdl_json_output) {
 		fprintf(stderr, "%s %1.2f%%\r", task_name, percent * 100);
 		fflush(stderr);
 	}

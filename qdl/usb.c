@@ -297,6 +297,23 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 
 		result[count].vid = desc.idVendor;
 		result[count].pid = desc.idProduct;
+		{
+			uint8_t port_numbers[8];
+			uint8_t bus_num = libusb_get_bus_number(dev);
+			int n_ports = libusb_get_port_numbers(dev, port_numbers,
+							      sizeof(port_numbers));
+			if (n_ports > 0) {
+				int pos = snprintf(result[count].usb_path,
+						   sizeof(result[count].usb_path),
+						   "%u-%u", bus_num, port_numbers[0]);
+				for (int j = 1; j < n_ports; j++)
+					pos += snprintf(result[count].usb_path + pos,
+							sizeof(result[count].usb_path) - pos,
+							".%u", port_numbers[j]);
+			} else {
+				result[count].usb_path[0] = '\0';
+			}
+		}
 		count++;
 	}
 
