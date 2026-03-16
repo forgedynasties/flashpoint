@@ -110,6 +110,22 @@ class DeviceScanner:
             return None
 
     @staticmethod
+    def _qdl_serial_from_device(device):
+        """Extract qdl serial from the USB iProduct string (SN:XXXXXXXX field).
+
+        e.g. 'TRINKET-IOT-IDP_CID:0411_SN:3D43FFB7' -> '3D43FFB7'
+        This is the same value the qdl list-server reports and what qdl -S expects.
+        """
+        try:
+            product = device.attributes.asstring('product')
+            m = re.search(r'SN:([0-9a-fA-F]+)', product)
+            if m:
+                return m.group(1)
+        except KeyError:
+            pass
+        return None
+
+    @staticmethod
     def get_adb_transport_map():
         """Map USB paths to ADB transport IDs.
 
@@ -162,11 +178,12 @@ class DeviceScanner:
                     continue
 
                 hw_sn = DeviceScanner._serial_from_device(device) or ""
+                qdl_sn = DeviceScanner._qdl_serial_from_device(device) or ""
                 has_adb = (vidpid in ("18d1:4e11", "05c6:901f") or path in usb_to_tid)
 
                 devices[path] = {
                     "serial": hw_sn,
-                    "qdl_serial": "",  # filled in by scan_all from qdl list-server
+                    "qdl_serial": qdl_sn,  # from iProduct SN field; supplemented by list-server
                     "mode": mode,
                     "has_adb": has_adb,
                     "path": path,
