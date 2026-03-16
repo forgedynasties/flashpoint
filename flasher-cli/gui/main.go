@@ -162,6 +162,7 @@ func main() {
 		}
 		pRows := make(map[string]*pRow, len(serials))
 
+		timeLabel := widget.NewLabel("")
 		progressBody.Objects = nil
 		for _, s := range serials {
 			bar := widget.NewProgressBar()
@@ -176,9 +177,11 @@ func main() {
 			pRows[s] = &pRow{bar, pct, status}
 			progressBody.Add(row)
 		}
+		progressBody.Add(timeLabel)
 		progressBody.Refresh()
 		progressCard.Show()
 
+		start := time.Now()
 		ctx := context.Background()
 		updates := flash.Many(ctx, serials, fw, false)
 
@@ -205,6 +208,10 @@ func main() {
 					}
 				})
 			}
+			elapsed := time.Since(start).Round(time.Second)
+			fyne.Do(func() {
+				timeLabel.SetText(fmt.Sprintf("Completed in %s", elapsed))
+			})
 			setRunning(false)
 		}()
 	}
