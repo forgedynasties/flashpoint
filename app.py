@@ -276,7 +276,8 @@ class FlashStation(QMainWindow):
             else:
                 device_info = self.devices[usb_path]
                 # Preserve existing serial — don't overwrite with empty string.
-                if serial and serial != existing_serial := device_info["serial"]:
+                existing_serial = device_info["serial"]
+                if serial and serial != existing_serial:
                     device_info["serial"] = serial
                 # Update qdl_serial whenever we get one (it's stable per device).
                 qdl_serial = info.get("qdl_serial", "")
