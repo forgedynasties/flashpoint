@@ -1,7 +1,11 @@
 """Firmware flashing utilities."""
+import logging
 import os
 import subprocess
+
 from config import QDL_BIN
+
+log = logging.getLogger(__name__)
 
 
 class FlashManager:
@@ -39,33 +43,34 @@ class FlashManager:
             return False
     
     @staticmethod
-    def build_flash_command(serial, prog, raw, patch):
+    def build_flash_command(serial, prog, raw, patch, progress_socket=None):
         """Build the QDL flash command.
-        
+
         Args:
             serial: Device serial number
             prog: Path to prog file
-            raw: Path to raw file  
+            raw: Path to raw file
             patch: Path to patch file
-            
+            progress_socket: Optional Unix socket path for JSON progress events
+
         Returns:
             list: Command arguments for subprocess
         """
-        firmware_dir = os.path.dirname(raw)
-        return [
+        cmd = [
             "sudo",
             QDL_BIN,
             "--json",
-            "-S",
-            serial,
-            "-s",
-            "emmc",
+            "-S", serial,
+            "-s", "emmc",
             os.path.basename(prog),
             os.path.basename(raw),
             os.path.basename(patch),
-            "-u",
-            "1048576",
+            "-u", "1048576",
         ]
+        if progress_socket:
+            cmd.extend(["--progress-socket", progress_socket])
+            log.debug("Flash command includes progress socket: %s", progress_socket)
+        return cmd
     
     @staticmethod
     def get_working_directory(raw_path):

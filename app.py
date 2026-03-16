@@ -1,6 +1,9 @@
 """Main application window for the flash station."""
-import os
 import json
+import logging
+import os
+import subprocess
+
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
     QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QProgressBar,
@@ -8,11 +11,14 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QTimer, Qt, QProcess, QRect
 from PyQt6.QtGui import QColor, QPen, QBrush
+from PyQt6.QtNetwork import QLocalServer
 
-from config import SCAN_INTERVAL_MS, FW_PATH_ENV
+from config import SCAN_INTERVAL_MS, FW_PATH_ENV, QDL_BIN, QDL_LIST_SOCKET, QDL_PROGRESS_SOCK_PREFIX
 from styles import Styles, Colors, STATUS_COLORS
 from utils_device_manager import DeviceScanner
 from utils_flash_manager import FlashManager, RebootManager
+
+log = logging.getLogger(__name__)
 
 # Column indices
 COL_CHECK    = 0
@@ -81,6 +87,7 @@ class FlashStation(QMainWindow):
 
         self.setup_ui()
         self.setup_scanning()
+        self._start_list_server()
 
     def setup_ui(self):
         self.central_widget = QWidget()
@@ -187,6 +194,26 @@ class FlashStation(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.scan)
         self.timer.start(SCAN_INTERVAL_MS)
+
+    def _start_list_server(self):
+        """Launch qdl list-server in the background so EDL device queries work."""
+        try:
+            self._list_server_proc = subprocess.Popen(
+                ["sudo", QDL_BIN, "list-server", "--socket", QDL_LIST_SOCKET],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            log.info("Started qdl list-server (pid=%d) on %s",
+                     self._list_server_proc.pid, QDL_LIST_SOCKET)
+        except Exception as exc:
+            log.warning("Could not start qdl list-server: %s", exc)
+            self._list_server_proc = None
+
+    def closeEvent(self, event):
+        if getattr(self, '_list_server_proc', None):
+            log.info("Stopping qdl list-server (pid=%d)", self._list_server_proc.pid)
+            self._list_server_proc.terminate()
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # Firmware helpers
@@ -631,30 +658,64 @@ class FlashStation(QMainWindow):
         device_info["log_box"].setText("")
         self._update_ui_lock()
 
+        # Progress socket server — GUI listens, qdl connects as client
+        sock_name = f"{QDL_PROGRESS_SOCK_PREFIX}{serial}"
+        QLocalServer.removeServer(sock_name)
+        progress_server = QLocalServer()
+        progress_server.listen(sock_name)
+        progress_sock_path = progress_server.fullServerName()
+        log.debug("Progress server for %s at %s", serial, progress_sock_path)
+
         process = QProcess()
-        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-
         process_info["process"] = process
+        process_info["progress_server"] = progress_server
+        process_info["progress_socket"] = None
 
-        def handle_output():
-            data = process.readAllStandardOutput().data().decode()
+        def on_progress_connected():
+            sock = progress_server.nextPendingConnection()
+            if not sock:
+                return
+            process_info["progress_socket"] = sock
+            log.debug("Progress socket connected for %s", serial)
+            sock.readyRead.connect(lambda: _read_progress(sock))
+
+        def _read_progress(sock):
+            data = bytes(sock.readAll()).decode(errors='replace')
             for line in data.splitlines():
-                stripped = line.strip()
-                if not stripped:
+                line = line.strip()
+                if not line:
                     continue
                 try:
-                    msg = json.loads(stripped)
+                    msg = json.loads(line)
                     event = msg.get("event")
                     if event == "progress":
                         pct = min(int(msg["percent"]), 100)
                         device_info["progress"].setValue(pct)
-                        device_info["log_box"].setText(f'{msg["task"]} {msg["percent"]:.1f}%')
+                        device_info["log_box"].setText(
+                            f'{msg["task"]} {msg["percent"]:.1f}%')
                     elif event in ("info", "error"):
-                        device_info["log_box"].setText(msg.get("message", "").strip())
+                        device_info["log_box"].setText(
+                            msg.get("message", "").strip())
+                        log.log(
+                            logging.WARNING if event == "error" else logging.DEBUG,
+                            "qdl [%s] %s: %s", serial, event,
+                            msg.get("message", ""))
                 except (json.JSONDecodeError, KeyError):
-                    device_info["log_box"].setText(stripped)
+                    device_info["log_box"].setText(line)
+
+        # Drain stdout to prevent pipe blocking (qdl also writes --json to stdout)
+        process.readyReadStandardOutput.connect(
+            lambda: log.debug("qdl stdout [%s]: %s", serial,
+                              process.readAllStandardOutput().data()
+                              .decode(errors='replace').strip()))
 
         def handle_finished(exit_code):
+            log.info("qdl finished for %s with exit code %d", serial, exit_code)
+            if process_info.get("progress_socket"):
+                process_info["progress_socket"].close()
+            progress_server.close()
+            QLocalServer.removeServer(sock_name)
+
             process_info["is_flashing"] = False
             device_info["is_flashing"] = False
             device_info["btn_flash"].setEnabled(True)
@@ -663,20 +724,24 @@ class FlashStation(QMainWindow):
                 device_info["status_item"].setText("success")
                 device_info["status_item"].setForeground(QColor(Colors.SUCCESS))
                 device_info["progress"].setValue(100)
-                device_info["progress"].setStyleSheet(Styles.get_progress_bar_style(Colors.SUCCESS))
+                device_info["progress"].setStyleSheet(
+                    Styles.get_progress_bar_style(Colors.SUCCESS))
             else:
                 device_info["status_item"].setText("failed")
                 device_info["status_item"].setForeground(QColor(Colors.ERROR))
                 device_info["progress"].setValue(0)
-                device_info["progress"].setStyleSheet(Styles.get_progress_bar_style(Colors.ERROR))
+                device_info["progress"].setStyleSheet(
+                    Styles.get_progress_bar_style(Colors.ERROR))
 
             self._update_ui_lock()
 
-        process.readyReadStandardOutput.connect(handle_output)
+        progress_server.newConnection.connect(on_progress_connected)
         process.finished.connect(lambda code: handle_finished(code))
 
         firmware_dir = FlashManager.get_working_directory(raw)
-        args = FlashManager.build_flash_command(serial, prog, raw, patch)
+        args = FlashManager.build_flash_command(serial, prog, raw, patch,
+                                                progress_socket=progress_sock_path)
+        log.info("Starting flash for %s: %s", serial, " ".join(args))
         process.setWorkingDirectory(firmware_dir)
         process.start(args[0], args[1:])
 

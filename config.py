@@ -2,7 +2,11 @@
 import os
 
 # Paths and binaries
-QDL_BIN = os.path.expanduser("~/aio/qdl/qdl")
+QDL_BIN = os.path.expanduser("/home/flasher02/flashpoint/qdl/qdl")
+
+# IPC socket paths
+QDL_LIST_SOCKET          = "/tmp/qdl-list.sock"
+QDL_PROGRESS_SOCK_PREFIX = "qdl-progress-"  # Qt local server name prefix
 
 # Device scanning
 SCAN_INTERVAL_MS = 1500

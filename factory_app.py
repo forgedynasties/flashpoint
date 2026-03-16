@@ -1,7 +1,10 @@
 """Factory Assembly Flash Station — automated 3-stage flashing pipeline."""
-import os
 import json
+import logging
+import os
+import subprocess
 from datetime import datetime, timezone
+
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QTableWidget, QTableWidgetItem, QProgressBar,
@@ -9,6 +12,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QTimer, Qt, QProcess
 from PyQt6.QtGui import QColor
+from PyQt6.QtNetwork import QLocalServer
 
 from config import (
     SCAN_INTERVAL_MS,
@@ -16,10 +20,13 @@ from config import (
     BOOT_TIMEOUT_SEC_ENV, DEFAULT_BOOT_TIMEOUT_SEC,
     EXPECTED_BUILD_ID,
     FACTORY_REPORTS_DIR_ENV, DEFAULT_REPORTS_DIR,
+    QDL_BIN, QDL_LIST_SOCKET, QDL_PROGRESS_SOCK_PREFIX,
 )
 from styles import Styles, Colors
 from utils_device_manager import DeviceScanner
 from utils_flash_manager import FlashManager, RebootManager
+
+log = logging.getLogger(__name__)
 
 # ── Pipeline states ────────────────────────────────────────────────────────────
 S_WAITING       = "WAITING"
@@ -94,6 +101,7 @@ class FactoryStation(QMainWindow):
 
         self._setup_ui()
         self._setup_scanning()
+        self._start_list_server()
 
     # ── UI setup ───────────────────────────────────────────────────────────────
 
@@ -189,6 +197,26 @@ class FactoryStation(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self._scan)
         self.timer.start(SCAN_INTERVAL_MS)
+
+    def _start_list_server(self):
+        """Launch qdl list-server in the background so EDL device queries work."""
+        try:
+            self._list_server_proc = subprocess.Popen(
+                ["sudo", QDL_BIN, "list-server", "--socket", QDL_LIST_SOCKET],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            log.info("Started qdl list-server (pid=%d) on %s",
+                     self._list_server_proc.pid, QDL_LIST_SOCKET)
+        except Exception as exc:
+            log.warning("Could not start qdl list-server: %s", exc)
+            self._list_server_proc = None
+
+    def closeEvent(self, event):
+        if getattr(self, '_list_server_proc', None):
+            log.info("Stopping qdl list-server (pid=%d)", self._list_server_proc.pid)
+            self._list_server_proc.terminate()
+        super().closeEvent(event)
 
     # ── Scanning ───────────────────────────────────────────────────────────────
 
@@ -402,29 +430,63 @@ class FactoryStation(QMainWindow):
         self._set_state(serial, state)
         dev["log_lbl"].setText("")
 
+        # Progress socket server — GUI listens, qdl connects as client
+        sock_name = f"{QDL_PROGRESS_SOCK_PREFIX}{serial}-s{stage}"
+        QLocalServer.removeServer(sock_name)
+        progress_server = QLocalServer()
+        progress_server.listen(sock_name)
+        progress_sock_path = progress_server.fullServerName()
+        log.debug("Progress server for %s stage %d at %s", serial, stage, progress_sock_path)
+
+        dev["progress_server"] = progress_server
+        dev["progress_socket"] = None
+
         process = QProcess()
-        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         dev["process"] = process
 
-        def on_output():
-            data = process.readAllStandardOutput().data().decode()
+        def on_progress_connected():
+            sock = progress_server.nextPendingConnection()
+            if not sock:
+                return
+            dev["progress_socket"] = sock
+            log.debug("Progress socket connected for %s stage %d", serial, stage)
+            sock.readyRead.connect(lambda: _read_progress(sock))
+
+        def _read_progress(sock):
+            data = bytes(sock.readAll()).decode(errors='replace')
             for line in data.splitlines():
-                stripped = line.strip()
-                if not stripped:
+                line = line.strip()
+                if not line:
                     continue
                 try:
-                    msg = json.loads(stripped)
+                    msg = json.loads(line)
                     event = msg.get("event")
                     if event == "progress":
                         pct = min(int(msg["percent"]), 100)
                         dev["progress"].setValue(pct)
-                        dev["log_lbl"].setText(f'{msg["task"]} {msg["percent"]:.1f}%')
+                        dev["log_lbl"].setText(
+                            f'{msg["task"]} {msg["percent"]:.1f}%')
                     elif event in ("info", "error"):
                         dev["log_lbl"].setText(msg.get("message", "").strip())
+                        log.log(
+                            logging.WARNING if event == "error" else logging.DEBUG,
+                            "qdl [%s s%d] %s: %s", serial, stage, event,
+                            msg.get("message", ""))
                 except (json.JSONDecodeError, KeyError):
-                    dev["log_lbl"].setText(stripped)
+                    dev["log_lbl"].setText(line)
+
+        # Drain stdout to prevent pipe blocking
+        process.readyReadStandardOutput.connect(
+            lambda: log.debug("qdl stdout [%s s%d]: %s", serial, stage,
+                              process.readAllStandardOutput().data()
+                              .decode(errors='replace').strip()))
 
         def on_finished(code):
+            log.info("qdl stage %d finished for %s with exit code %d", stage, serial, code)
+            if dev.get("progress_socket"):
+                dev["progress_socket"].close()
+            progress_server.close()
+            QLocalServer.removeServer(sock_name)
             dev["process"] = None
             if code == 0:
                 dev["progress"].setValue(100)
@@ -439,9 +501,11 @@ class FactoryStation(QMainWindow):
                 self._set_failed(serial, f"Stage {stage} flash failed (exit {code})")
             self._check_complete()
 
-        process.readyReadStandardOutput.connect(on_output)
+        progress_server.newConnection.connect(on_progress_connected)
         process.finished.connect(lambda code: on_finished(code))
-        args = FlashManager.build_flash_command(serial, prog, raw, patch)
+        args = FlashManager.build_flash_command(serial, prog, raw, patch,
+                                                progress_socket=progress_sock_path)
+        log.info("Starting stage %d flash for %s: %s", stage, serial, " ".join(args))
         process.setWorkingDirectory(FlashManager.get_working_directory(raw))
         process.start(args[0], args[1:])
 
