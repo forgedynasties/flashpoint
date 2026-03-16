@@ -307,6 +307,10 @@ class FlashStation(QMainWindow):
 
             self.update_device_status(device_info, status, has_adb, build_id, path_display)
 
+            # Show qdl serial in EDL mode, ADB serial otherwise
+            displayed_serial = device_info["qdl_serial"] if status == "edl" else device_info["serial"]
+            device_info["serial_item"].setText(displayed_serial or device_info["serial"])
+
             # Refresh transport ID — it changes after every reconnect so we never cache
             # it across scans; always use the value from the most recent scan.
             if "adb_tid" in info:
@@ -430,6 +434,7 @@ class FlashStation(QMainWindow):
         self.devices[usb_path] = {
             "serial": serial,
             "qdl_serial": "",
+            "serial_item": serial_item,
             "row": row,
             "chk": chk,
             "status_item": status_item,
