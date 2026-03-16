@@ -98,6 +98,7 @@ class FactoryStation(QMainWindow):
         self.run_active  = False
         self.run_serials = set()
         self.cycle_start: datetime | None = None
+        self._flash_count = 0
 
         self._setup_ui()
         self._setup_scanning()
@@ -430,6 +431,10 @@ class FactoryStation(QMainWindow):
         self._set_state(serial, state)
         dev["log_lbl"].setText("")
 
+        self._flash_count += 1
+        if self._flash_count == 1:
+            self.timer.stop()
+
         # Progress socket server — GUI listens, qdl connects as client
         sock_name = f"{QDL_PROGRESS_SOCK_PREFIX}{serial}-s{stage}"
         QLocalServer.removeServer(sock_name)
@@ -488,6 +493,9 @@ class FactoryStation(QMainWindow):
             progress_server.close()
             QLocalServer.removeServer(sock_name)
             dev["process"] = None
+            self._flash_count = max(0, self._flash_count - 1)
+            if self._flash_count == 0:
+                self.timer.start(SCAN_INTERVAL_MS)
             if code == 0:
                 dev["progress"].setValue(100)
                 if stage == 1:

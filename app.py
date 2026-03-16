@@ -715,6 +715,15 @@ class FlashStation(QMainWindow):
 
         process_info["is_flashing"] = True
         device_info["is_flashing"] = True
+
+        # Pause scanning while any device is flashing to prevent
+        # the list-server from sending concurrent USB control transfers
+        # during the reset sequence (causes 1/10 "iProduct timeout" failures).
+        if not hasattr(self, '_flash_count'):
+            self._flash_count = 0
+        self._flash_count += 1
+        if self._flash_count == 1:
+            self.timer.stop()
         device_info["btn_flash"].setEnabled(False)
         device_info["btn_edl"].setEnabled(False)
         device_info["status_item"].setText("flashing")
@@ -784,6 +793,9 @@ class FlashStation(QMainWindow):
 
             process_info["is_flashing"] = False
             device_info["is_flashing"] = False
+            self._flash_count = max(0, getattr(self, '_flash_count', 1) - 1)
+            if self._flash_count == 0:
+                self.timer.start(SCAN_INTERVAL_MS)
             device_info["btn_flash"].setEnabled(True)
 
             if exit_code == 0:
