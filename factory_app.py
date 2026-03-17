@@ -98,7 +98,6 @@ class FactoryStation(QMainWindow):
         self.run_active  = False
         self.run_serials = set()
         self.cycle_start: datetime | None = None
-        self._flash_count = 0
 
         self._setup_ui()
         self._setup_scanning()
@@ -391,6 +390,7 @@ class FactoryStation(QMainWindow):
         self.run_active  = True
         self.run_serials = set(self.devices.keys())
         self.cycle_start = datetime.now()
+        self.timer.stop()   # No USB polling for the entire run duration
 
         self.btn_start.setEnabled(False)
         self.btn_start.setText("Running...")
@@ -417,6 +417,7 @@ class FactoryStation(QMainWindow):
                 self._set_state(usb_path, S_FAILED, "Stopped by operator")
 
         self.run_active = False
+        self.timer.start(SCAN_INTERVAL_MS)  # Resume USB polling
         self.run_serials.clear()
         self.btn_stop.setEnabled(False)
         self.btn_start.setEnabled(True)
@@ -444,10 +445,6 @@ class FactoryStation(QMainWindow):
 
         self._set_state(usb_path, state)
         dev["log_lbl"].setText("")
-
-        self._flash_count += 1
-        if self._flash_count == 1:
-            self.timer.stop()
 
         # Progress socket server — GUI listens, qdl connects as client
         sock_name = f"{QDL_PROGRESS_SOCK_PREFIX}{usb_path}-s{stage}"
@@ -507,15 +504,13 @@ class FactoryStation(QMainWindow):
             progress_server.close()
             QLocalServer.removeServer(sock_name)
             dev["process"] = None
-            self._flash_count = max(0, self._flash_count - 1)
-            if self._flash_count == 0:
-                self.timer.start(SCAN_INTERVAL_MS)
             if code == 0:
                 dev["progress"].setValue(100)
                 if stage == 1:
                     self._set_state(usb_path, S_BOOTING)
                     dev["log_lbl"].setText("Waiting for device to boot…")
                     self._start_boot_timer(usb_path)
+                    self._start_boot_poll(usb_path)
                 else:
                     self._set_state(usb_path, S_DONE)
                     dev["log_lbl"].setText("Complete")
@@ -547,6 +542,60 @@ class FactoryStation(QMainWindow):
             t.stop()
             dev["boot_timer"] = None
 
+    # ── Inter-stage device polling (used while main timer is stopped) ──────────
+
+    def _start_boot_poll(self, usb_path):
+        """Poll for device boot via pyudev only — no list-server, safe during USB reset."""
+        QTimer.singleShot(SCAN_INTERVAL_MS, lambda: self._poll_for_boot(usb_path))
+
+    def _poll_for_boot(self, usb_path):
+        dev = self.devices.get(usb_path)
+        if not dev or dev["state"] != S_BOOTING:
+            return
+        booted = DeviceScanner.get_booted_devices()
+        info = booted.get(usb_path)
+        if info and info.get("has_adb"):
+            tid = info.get("adb_tid")
+            if tid:
+                build_id = DeviceScanner.get_build_id(tid)
+                if build_id:
+                    self.adb_map[usb_path] = tid
+                    self._cancel_boot_timer(usb_path)
+                    if build_id == EXPECTED_BUILD_ID:
+                        self._set_state(usb_path, S_REBOOTING_EDL)
+                        RebootManager.reboot_to_edl(tid)
+                        self._start_edl_poll(usb_path)
+                    else:
+                        self._set_failed(usb_path,
+                                         f"Build ID mismatch: got {build_id!r}")
+                    return
+        QTimer.singleShot(SCAN_INTERVAL_MS, lambda: self._poll_for_boot(usb_path))
+
+    def _start_edl_poll(self, usb_path):
+        """Wait for device to re-enumerate in EDL after reboot, then trigger stage 3.
+
+        Uses a 3 s initial delay so the device is stable before the list-server
+        queries it — this is the window where the race condition previously occurred.
+        """
+        QTimer.singleShot(3000, lambda: self._poll_for_edl(usb_path))
+
+    def _poll_for_edl(self, usb_path):
+        dev = self.devices.get(usb_path)
+        if not dev or dev["state"] != S_REBOOTING_EDL:
+            return
+        edl_devices = DeviceScanner.get_edl_devices()
+        qdl_serial = dev.get("qdl_serial", "")
+        found = usb_path in edl_devices or (
+            qdl_serial and any(
+                info.get("serial") == qdl_serial
+                for info in edl_devices.values()
+            )
+        )
+        if found:
+            self._start_flash(usb_path, stage=3)
+            return
+        QTimer.singleShot(SCAN_INTERVAL_MS, lambda: self._poll_for_edl(usb_path))
+
     def _on_boot_timeout(self, usb_path):
         if usb_path in self.devices and self.devices[usb_path]["state"] == S_BOOTING:
             self._set_state(usb_path, S_TIMEOUT,
@@ -564,6 +613,7 @@ class FactoryStation(QMainWindow):
         ]
         if not pending:
             self.run_active = False
+            self.timer.start(SCAN_INTERVAL_MS)  # Resume USB polling after run
             self.btn_stop.setEnabled(False)
             self.btn_start.setText("Start")
             self.btn_start.setEnabled(True)
