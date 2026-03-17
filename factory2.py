@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import subprocess
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -38,6 +39,27 @@ from utils_flash_manager import FlashManager, RebootManager
 log = logging.getLogger(__name__)
 
 EDL_RETURN_TIMEOUT_MS = 60_000   # 60 s for devices to return to EDL after reboot
+
+def _count_flash_ops(raw_xml_path):
+    """Count actual flash operations from rawprogram.xml.
+
+    Only <program> tags with a non-empty filename are executed by qdl
+    (erases and filename-less entries are skipped in program_execute).
+    Sparse images are NOT pre-split here so this is a lower bound, but
+    it is used only as the progress denominator and is accurate for
+    non-sparse firmware images.
+    """
+    try:
+        tree = ET.parse(raw_xml_path)
+        count = sum(
+            1 for p in tree.findall(".//program")
+            if (p.get("filename") or "").strip()
+        )
+        return max(count, 1)
+    except Exception as exc:
+        log.warning("Could not count flash ops in %s: %s", raw_xml_path, exc)
+        return 1
+
 
 # ── Phase constants ──────────────────────────────────────────────────────────
 P_IDLE    = "IDLE"
@@ -105,7 +127,8 @@ class CountFactoryStation(QMainWindow):
         self._processes     = []      # active QProcess instances this stage
         self._done_count    = 0       # flash completions this stage
         self._failed_count  = 0
-        self._dev_progress  = {}      # idx → pct for average progress display
+        self._total_ops     = 1       # flash ops per firmware (from rawprogram.xml)
+        self._dev_progress  = {}      # idx → {completed, pct, task}
         self._poll_timer    = None
         self._timeout_timer = None
 
@@ -352,7 +375,9 @@ class CountFactoryStation(QMainWindow):
 
         self._done_count   = 0
         self._failed_count = 0
-        self._dev_progress = {i: 0 for i in range(n)}
+        self._total_ops    = _count_flash_ops(raw)
+        self._dev_progress = {i: {"completed": 0, "pct": 0.0, "task": ""}
+                              for i in range(n)}
         self._processes    = []
         wdir = FlashManager.get_working_directory(raw)
 
@@ -400,11 +425,42 @@ class CountFactoryStation(QMainWindow):
                 continue
             try:
                 msg = json.loads(line)
-                if msg.get("event") == "progress":
-                    self._dev_progress[idx] = min(int(msg["percent"]), 100)
-                    avg = sum(self._dev_progress.values()) / total
-                    self._set_progress(int(avg))
-            except (json.JSONDecodeError, KeyError):
+                if msg.get("event") != "progress":
+                    continue
+                task = msg.get("task", "")
+                pct  = min(float(msg["percent"]), 100.0)
+                dev  = self._dev_progress[idx]
+
+                # qdl emits one 0→100 sequence per flash operation (per program
+                # entry).  Two cases signal that the previous op completed and a
+                # new one started:
+                #
+                #  1. Task name changed  — different partition label.
+                #  2. Same task name but percent reset to near-zero after being
+                #     near-complete — sparse images split into multiple chunks
+                #     that all share the same label (firehose.c:607).
+                prev_pct  = dev["pct"]
+                prev_task = dev["task"]
+                new_op = (
+                    (task != prev_task and prev_task and prev_pct >= 50.0) or
+                    (task == prev_task and prev_task and pct <= 5.0 and prev_pct >= 95.0)
+                )
+                if new_op:
+                    dev["completed"] += 1
+
+                dev["task"] = task
+                dev["pct"]  = pct
+
+                # Overall progress: (completed_ops + current_pct/100) per device,
+                # normalised by total_ops * n_devices.
+                # Capped at 99 — 100 is only set when all qdl processes exit OK.
+                total_work = self._total_ops * total   # units = full ops
+                done_work  = sum(
+                    d["completed"] + d["pct"] / 100.0
+                    for d in self._dev_progress.values()
+                )
+                self._set_progress(min(int(done_work / total_work * 100), 99))
+            except (json.JSONDecodeError, KeyError, ZeroDivisionError):
                 pass
 
     def _on_flash_done(self, code, stage, serial, total):
