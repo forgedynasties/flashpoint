@@ -225,24 +225,30 @@ class FactoryStation(QMainWindow):
         connected, info_map = DeviceScanner.scan_all()
 
         # Add new devices not yet in the table — only if already in EDL
-        for serial in connected:
-            if serial not in self.devices:
-                info = info_map.get(serial, {})
+        for usb_path in connected:
+            if usb_path not in self.devices:
+                info = info_map.get(usb_path, {})
                 if "edl" in info.get("mode", "").lower():
-                    self._add_row(serial)
+                    qdl_serial = info.get("qdl_serial", "") or info.get("serial", "")
+                    self._add_row(usb_path, qdl_serial)
 
         # Update per-device state from scan results
-        for serial, info in info_map.items():
-            if serial not in self.devices:
+        for usb_path, info in info_map.items():
+            if usb_path not in self.devices:
                 continue
-            dev = self.devices[serial]
+            dev = self.devices[usb_path]
             mode    = info["mode"].lower()
             has_adb = info.get("has_adb", False)
             build_id = info.get("build_id", "")
 
             # Track ADB transport id
             if "adb_tid" in info:
-                self.adb_map[serial] = info["adb_tid"]
+                self.adb_map[usb_path] = info["adb_tid"]
+
+            # Update qdl_serial whenever we get one (it's stable per device)
+            qdl_serial = info.get("qdl_serial", "")
+            if qdl_serial and not dev.get("qdl_serial"):
+                dev["qdl_serial"] = qdl_serial
 
             # Update is_edl flag (used by Start button and pipeline)
             dev["is_edl"] = "edl" in mode
@@ -251,32 +257,32 @@ class FactoryStation(QMainWindow):
 
             if state == S_BOOTING:
                 if has_adb and build_id:
-                    self._cancel_boot_timer(serial)
+                    self._cancel_boot_timer(usb_path)
                     if build_id == EXPECTED_BUILD_ID:
-                        self._set_state(serial, S_REBOOTING_EDL)
-                        if serial in self.adb_map:
-                            RebootManager.reboot_to_edl(self.adb_map[serial])
+                        self._set_state(usb_path, S_REBOOTING_EDL)
+                        if usb_path in self.adb_map:
+                            RebootManager.reboot_to_edl(self.adb_map[usb_path])
                     else:
-                        self._set_failed(serial,
+                        self._set_failed(usb_path,
                                          f"Build ID mismatch: got {build_id!r}")
 
             elif state == S_REBOOTING_EDL:
                 if dev["is_edl"]:
-                    self._start_flash(serial, stage=3)
+                    self._start_flash(usb_path, stage=3)
 
         # Remove WAITING devices that have disconnected (not part of any run)
-        for serial in list(self.devices.keys()):
-            if serial not in connected:
-                dev = self.devices[serial]
+        for usb_path in list(self.devices.keys()):
+            if usb_path not in connected:
+                dev = self.devices[usb_path]
                 if dev["state"] == S_WAITING:
-                    self._remove_row(serial)
+                    self._remove_row(usb_path)
 
         self._update_start_btn()
         self._update_summary()
 
     # ── Row management ─────────────────────────────────────────────────────────
 
-    def _add_row(self, serial):
+    def _add_row(self, usb_path, qdl_serial=""):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
@@ -287,7 +293,7 @@ class FactoryStation(QMainWindow):
 
         center = Qt.AlignmentFlag.AlignCenter
 
-        serial_item = item(serial)
+        serial_item = item(qdl_serial or usb_path)
         stage_item  = item("—", center)
         status_item = item(S_WAITING, center)
         status_item.setForeground(QColor(STATE_COLORS[S_WAITING]))
@@ -315,11 +321,13 @@ class FactoryStation(QMainWindow):
         log_lbl.setContentsMargins(6, 0, 6, 0)
         self.table.setCellWidget(row, COL_LOG, log_lbl)
 
-        self.devices[serial] = {
+        self.devices[usb_path] = {
             "row":         row,
+            "qdl_serial":  qdl_serial,
             "state":       S_WAITING,
             "fail_reason": "",
             "is_edl":      False,
+            "serial_item": serial_item,
             "stage_item":  stage_item,
             "status_item": status_item,
             "progress":    progress,
@@ -328,19 +336,19 @@ class FactoryStation(QMainWindow):
             "boot_timer":  None,
         }
 
-    def _remove_row(self, serial):
-        dev = self.devices.pop(serial)
+    def _remove_row(self, usb_path):
+        dev = self.devices.pop(usb_path)
         self.table.removeRow(dev["row"])
         # Fix row indices for remaining devices
         for d in self.devices.values():
             if d["row"] > dev["row"]:
                 d["row"] -= 1
-        self.adb_map.pop(serial, None)
+        self.adb_map.pop(usb_path, None)
 
     # ── State machine ──────────────────────────────────────────────────────────
 
-    def _set_state(self, serial, state, fail_reason=""):
-        dev = self.devices[serial]
+    def _set_state(self, usb_path, state, fail_reason=""):
+        dev = self.devices[usb_path]
         dev["state"]       = state
         dev["fail_reason"] = fail_reason
 
@@ -370,8 +378,8 @@ class FactoryStation(QMainWindow):
             dev["progress"].setValue(0)
             dev["progress"].setStyleSheet(Styles.get_progress_bar_style())
 
-    def _set_failed(self, serial, reason):
-        self._set_state(serial, S_FAILED, reason)
+    def _set_failed(self, usb_path, reason):
+        self._set_state(usb_path, S_FAILED, reason)
         self._check_complete()
 
     # ── Run control ────────────────────────────────────────────────────────────
@@ -388,25 +396,25 @@ class FactoryStation(QMainWindow):
         self.btn_start.setText("Running...")
         self.btn_stop.setEnabled(True)
 
-        for serial in list(self.run_serials):
-            dev = self.devices[serial]
+        for usb_path in list(self.run_serials):
+            dev = self.devices[usb_path]
             if dev["is_edl"]:
-                self._start_flash(serial, stage=1)
+                self._start_flash(usb_path, stage=1)
             else:
-                self._set_state(serial, S_SKIPPED)
+                self._set_state(usb_path, S_SKIPPED)
                 dev["log_lbl"].setText("Not in EDL at start")
 
         self._check_complete()
 
     def _stop_run(self):
-        for serial, dev in self.devices.items():
-            self._cancel_boot_timer(serial)
+        for usb_path, dev in self.devices.items():
+            self._cancel_boot_timer(usb_path)
             proc = dev.get("process")
             if proc and proc.state() != QProcess.ProcessState.NotRunning:
                 proc.kill()
                 dev["process"] = None
             if dev["state"] not in TERMINAL:
-                self._set_state(serial, S_FAILED, "Stopped by operator")
+                self._set_state(usb_path, S_FAILED, "Stopped by operator")
 
         self.run_active = False
         self.run_serials.clear()
@@ -417,18 +425,24 @@ class FactoryStation(QMainWindow):
 
     # ── Flash ──────────────────────────────────────────────────────────────────
 
-    def _start_flash(self, serial, stage: int):
-        dev = self.devices[serial]
+    def _start_flash(self, usb_path, stage: int):
+        dev = self.devices[usb_path]
         fw_path = self.factory_fw if stage == 1 else self.prod_fw
         state   = S_FLASH1       if stage == 1 else S_FLASH3
+        qdl_serial = dev.get("qdl_serial", "")
+
+        if not qdl_serial:
+            self._set_failed(usb_path,
+                             f"Stage {stage}: no QDL serial for device at {usb_path}")
+            return
 
         prog, raw, patch = FlashManager.find_firmware_files(fw_path)
         if not (prog and raw and patch):
-            self._set_failed(serial,
+            self._set_failed(usb_path,
                              f"Stage {stage} firmware not found in: {fw_path}")
             return
 
-        self._set_state(serial, state)
+        self._set_state(usb_path, state)
         dev["log_lbl"].setText("")
 
         self._flash_count += 1
@@ -436,12 +450,12 @@ class FactoryStation(QMainWindow):
             self.timer.stop()
 
         # Progress socket server — GUI listens, qdl connects as client
-        sock_name = f"{QDL_PROGRESS_SOCK_PREFIX}{serial}-s{stage}"
+        sock_name = f"{QDL_PROGRESS_SOCK_PREFIX}{usb_path}-s{stage}"
         QLocalServer.removeServer(sock_name)
         progress_server = QLocalServer()
         progress_server.listen(sock_name)
         progress_sock_path = progress_server.fullServerName()
-        log.debug("Progress server for %s stage %d at %s", serial, stage, progress_sock_path)
+        log.debug("Progress server for %s stage %d at %s", usb_path, stage, progress_sock_path)
 
         dev["progress_server"] = progress_server
         dev["progress_socket"] = None
@@ -454,7 +468,7 @@ class FactoryStation(QMainWindow):
             if not sock:
                 return
             dev["progress_socket"] = sock
-            log.debug("Progress socket connected for %s stage %d", serial, stage)
+            log.debug("Progress socket connected for %s stage %d", usb_path, stage)
             sock.readyRead.connect(lambda: _read_progress(sock))
 
         def _read_progress(sock):
@@ -475,19 +489,19 @@ class FactoryStation(QMainWindow):
                         dev["log_lbl"].setText(msg.get("message", "").strip())
                         log.log(
                             logging.WARNING if event == "error" else logging.DEBUG,
-                            "qdl [%s s%d] %s: %s", serial, stage, event,
+                            "qdl [%s s%d] %s: %s", usb_path, stage, event,
                             msg.get("message", ""))
                 except (json.JSONDecodeError, KeyError):
                     dev["log_lbl"].setText(line)
 
         # Drain stdout to prevent pipe blocking
         process.readyReadStandardOutput.connect(
-            lambda: log.debug("qdl stdout [%s s%d]: %s", serial, stage,
+            lambda: log.debug("qdl stdout [%s s%d]: %s", usb_path, stage,
                               process.readAllStandardOutput().data()
                               .decode(errors='replace').strip()))
 
         def on_finished(code):
-            log.info("qdl stage %d finished for %s with exit code %d", stage, serial, code)
+            log.info("qdl stage %d finished for %s with exit code %d", stage, usb_path, code)
             if dev.get("progress_socket"):
                 dev["progress_socket"].close()
             progress_server.close()
@@ -499,43 +513,43 @@ class FactoryStation(QMainWindow):
             if code == 0:
                 dev["progress"].setValue(100)
                 if stage == 1:
-                    self._set_state(serial, S_BOOTING)
+                    self._set_state(usb_path, S_BOOTING)
                     dev["log_lbl"].setText("Waiting for device to boot…")
-                    self._start_boot_timer(serial)
+                    self._start_boot_timer(usb_path)
                 else:
-                    self._set_state(serial, S_DONE)
+                    self._set_state(usb_path, S_DONE)
                     dev["log_lbl"].setText("Complete")
             else:
-                self._set_failed(serial, f"Stage {stage} flash failed (exit {code})")
+                self._set_failed(usb_path, f"Stage {stage} flash failed (exit {code})")
             self._check_complete()
 
         progress_server.newConnection.connect(on_progress_connected)
         process.finished.connect(lambda code: on_finished(code))
-        args = FlashManager.build_flash_command(serial, prog, raw, patch,
+        args = FlashManager.build_flash_command(qdl_serial, prog, raw, patch,
                                                 progress_socket=progress_sock_path)
-        log.info("Starting stage %d flash for %s: %s", stage, serial, " ".join(args))
+        log.info("Starting stage %d flash for %s (qdl_serial=%s): %s", stage, usb_path, qdl_serial, " ".join(args))
         process.setWorkingDirectory(FlashManager.get_working_directory(raw))
         process.start(args[0], args[1:])
 
     # ── Boot timer ─────────────────────────────────────────────────────────────
 
-    def _start_boot_timer(self, serial):
+    def _start_boot_timer(self, usb_path):
         timer = QTimer()
         timer.setSingleShot(True)
-        timer.timeout.connect(lambda: self._on_boot_timeout(serial))
+        timer.timeout.connect(lambda: self._on_boot_timeout(usb_path))
         timer.start(self.boot_timeout_ms)
-        self.devices[serial]["boot_timer"] = timer
+        self.devices[usb_path]["boot_timer"] = timer
 
-    def _cancel_boot_timer(self, serial):
-        dev = self.devices.get(serial, {})
+    def _cancel_boot_timer(self, usb_path):
+        dev = self.devices.get(usb_path, {})
         t = dev.get("boot_timer")
         if t:
             t.stop()
             dev["boot_timer"] = None
 
-    def _on_boot_timeout(self, serial):
-        if serial in self.devices and self.devices[serial]["state"] == S_BOOTING:
-            self._set_state(serial, S_TIMEOUT,
+    def _on_boot_timeout(self, usb_path):
+        if usb_path in self.devices and self.devices[usb_path]["state"] == S_BOOTING:
+            self._set_state(usb_path, S_TIMEOUT,
                             f"Device did not boot within {self.boot_timeout_ms // 1000}s")
             self._check_complete()
 
@@ -568,18 +582,19 @@ class FactoryStation(QMainWindow):
 
         done = skipped = failed = timeout = 0
         lines = []
-        for serial in sorted(self.run_serials):
-            dev = self.devices.get(serial)
+        for usb_path in sorted(self.run_serials):
+            dev = self.devices.get(usb_path)
             if not dev:
                 continue
             state  = dev["state"]
             reason = dev["fail_reason"]
+            display = dev.get("qdl_serial") or usb_path
             if state == S_DONE:             done    += 1
             elif state == S_SKIPPED:        skipped += 1
             elif state == S_TIMEOUT:        timeout += 1
             elif state == S_FAILED:         failed  += 1
             suffix = f"  —  {reason}" if reason else ""
-            lines.append(f"{serial:<22}  {state:<14}{suffix}")
+            lines.append(f"{display:<22}  {state:<14}{suffix}")
 
         summary = (
             f"  DONE: {done}    FAILED: {failed}"
@@ -658,9 +673,9 @@ class FactoryStation(QMainWindow):
 
     def _new_cycle(self):
         """Clear all terminal-state devices and reset for the next batch."""
-        for serial in list(self.devices.keys()):
-            if self.devices[serial]["state"] in TERMINAL:
-                self._remove_row(serial)
+        for usb_path in list(self.devices.keys()):
+            if self.devices[usb_path]["state"] in TERMINAL:
+                self._remove_row(usb_path)
         self.run_serials.clear()
         self._update_summary()
         self._update_start_btn()
