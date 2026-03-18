@@ -252,20 +252,20 @@ class CountFactoryStation(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
-        self.progress.setFixedHeight(20)
+        self.progress.setFixedHeight(30)
         self.progress.setStyleSheet(Styles.get_progress_bar_style())
         pl.addWidget(self.progress)
 
         self.lbl_detail = QLabel("Waiting for EDL devices…")
         self.lbl_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_detail.setStyleSheet(
-            f"color:{Colors.TEXT_SECONDARY};font-size:12px;"
+            f"color:{Colors.WHITE};font-size:16px;font-weight:700;"
         )
 
         self.lbl_eta = QLabel("")
         self.lbl_eta.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_eta.setStyleSheet(
-            f"color:{Colors.TEXT_SECONDARY};font-size:11px;"
+            f"color:{Colors.WHITE};font-size:16px;font-weight:700;"
         )
 
         vbox.addSpacing(18)

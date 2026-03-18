@@ -148,18 +148,19 @@ class Styles:
             QProgressBar {{
                 background-color: {Colors.BG_ELEVATED};
                 border: none;
-                border-radius: 3px;
+                border-radius: 4px;
                 text-align: center;
-                color: {Colors.TEXT_SECONDARY};
-                font-size: 10px;
+                color: {Colors.WHITE};
+                font-size: 13px;
+                font-weight: 700;
             }}
             QProgressBar:disabled {{
                 background-color: {Colors.BG_ELEVATED};
-                color: {Colors.TEXT_SECONDARY};
+                color: {Colors.WHITE};
             }}
             QProgressBar::chunk {{
                 background-color: {color};
-                border-radius: 3px;
+                border-radius: 4px;
             }}
             QProgressBar::chunk:disabled {{
                 background-color: {color};
