@@ -98,11 +98,6 @@ else
     _fail "adb not found — run: sudo bash setup.sh"
 fi
 
-if command -v tmux &>/dev/null; then
-    _ok "tmux found"
-else
-    _warn "tmux not found (only needed for qdl-tmux.sh, not the main app)"
-fi
 
 # ── 4. Passwordless sudo for qdl ─────────────────────────────────────────────
 _hdr "[4/4] Sudo access"
