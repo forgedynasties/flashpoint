@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ── Activate venv ─────────────────────────────────────────────────────────────
-VENV_DIR="/home/cd4li/flashing/flasher-gui/.venv"
+VENV_DIR="$SCRIPT_DIR/.venv"
 if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
     echo "ERROR: venv not found at $VENV_DIR" >&2
     exit 1

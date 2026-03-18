@@ -4,3 +4,4 @@ reports/
 flasher-cli/flasher
 flasher-cli/flasher-gui
 *.pyc
+build/factory2-station/
