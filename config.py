@@ -1,8 +1,8 @@
 """Application configuration and constants."""
 import os
 
-# Paths and binaries
-QDL_BIN = os.path.expanduser("/home/flasher02/flashpoint/qdl/qdl")
+# Paths and binaries — can be overridden by the QDL_BIN env var (set by setup.sh)
+QDL_BIN = os.environ.get("QDL_BIN", "/usr/local/bin/qdl")
 
 # IPC socket paths
 QDL_LIST_SOCKET          = "/tmp/qdl-list.sock"

@@ -3,3 +3,4 @@ reports/
 *.log
 flasher-cli/flasher
 flasher-cli/flasher-gui
+*.pyc
