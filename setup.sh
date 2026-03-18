@@ -152,12 +152,12 @@ _write_env_block() {
 export QDL_BIN="$QDL_INSTALL_PATH"
 
 # FACTORY_FW_PATH: directory containing the factory-flash firmware
-# (prog*.elf, rawprogram*.xml, patch*.xml).  SET THIS before running.
-export FACTORY_FW_PATH="/home/flasher02/flashpoint/packages/ff-adb"
+# (prog*.elf, rawprogram*.xml, patch*.xml).
+export FACTORY_FW_PATH="$SCRIPT_DIR/packages/ff-adb"
 
 # PROD_DEBUG_FW_PATH: directory containing the prod/debug firmware
-# for the second flash stage.  SET THIS before running.
-export PROD_DEBUG_FW_PATH="/home/flasher02/flashpoint/packages/debug"
+# for the second flash stage.
+export PROD_DEBUG_FW_PATH="$SCRIPT_DIR/packages/debug"
 
 # BOOT_TIMEOUT_SEC: seconds to wait for device to boot between stages
 export BOOT_TIMEOUT_SEC="120"
