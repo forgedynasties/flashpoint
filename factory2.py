@@ -379,6 +379,8 @@ class CountFactoryStation(QMainWindow):
         self.btn_start.setText("Running…")
         self.btn_stop.setEnabled(True)
         self._cycle_t0 = time.monotonic()
+        self._set_progress(0)
+        self._set_eta("")
         self._log(f"Run started — {self._device_count} device(s) in EDL")
         self._flash_stage(serials, stage=1)
 
