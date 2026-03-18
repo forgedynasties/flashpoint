@@ -5,3 +5,6 @@ flasher-cli/flasher
 flasher-cli/flasher-gui
 *.pyc
 build/factory2-station/
+factory2-station.spec
+.gitignore
+dist/factory2-station
