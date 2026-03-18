@@ -15,8 +15,11 @@ import logging
 import os
 import re
 import subprocess
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
+
+from flash_timing import FlashTimingLog
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -40,25 +43,36 @@ log = logging.getLogger(__name__)
 
 EDL_RETURN_TIMEOUT_MS = 60_000   # 60 s for devices to return to EDL after reboot
 
-def _count_flash_ops(raw_xml_path):
-    """Count actual flash operations from rawprogram.xml.
+def _parse_flash_tasks(raw_xml_path):
+    """Return ordered list of task labels for actual flash ops in rawprogram.xml.
 
-    Only <program> tags with a non-empty filename are executed by qdl
-    (erases and filename-less entries are skipped in program_execute).
-    Sparse images are NOT pre-split here so this is a lower bound, but
-    it is used only as the progress denominator and is accurate for
-    non-sparse firmware images.
+    Only <program> tags with a non-empty filename are executed by qdl.
+    The label attribute is what qdl reports as "task" in progress events.
     """
     try:
         tree = ET.parse(raw_xml_path)
-        count = sum(
-            1 for p in tree.findall(".//program")
-            if (p.get("filename") or "").strip()
-        )
-        return max(count, 1)
+        tasks = []
+        for p in tree.findall(".//program"):
+            fn = (p.get("filename") or "").strip()
+            if fn:
+                label = (p.get("label") or p.get("LABEL") or "").strip() or fn
+                tasks.append(label)
+        return tasks if tasks else ["unknown"]
     except Exception as exc:
-        log.warning("Could not count flash ops in %s: %s", raw_xml_path, exc)
-        return 1
+        log.warning("Could not parse flash tasks in %s: %s", raw_xml_path, exc)
+        return ["unknown"]
+
+
+def _fmt_eta(sec: float) -> str:
+    if sec <= 0:
+        return "ETA: finishing…"
+    m, s = divmod(int(sec), 60)
+    if m >= 60:
+        h, m2 = divmod(m, 60)
+        return f"ETA: {h}h {m2}m"
+    if m:
+        return f"ETA: {m}m {s:02d}s"
+    return f"ETA: {s}s"
 
 
 # ── Phase constants ──────────────────────────────────────────────────────────
@@ -128,9 +142,13 @@ class CountFactoryStation(QMainWindow):
         self._done_count    = 0       # flash completions this stage
         self._failed_count  = 0
         self._total_ops     = 1       # flash ops per firmware (from rawprogram.xml)
-        self._dev_progress  = {}      # idx → {completed, pct, task}
+        self._flash_tasks   = ["unknown"]  # ordered task labels from rawprogram.xml
+        self._task_weights  = [1.0]        # duration-proportional weight per task
+        self._dev_progress  = {}      # idx → {completed, pct, task, op_t0}
+        self._stage_t0      = 0.0     # monotonic time when flash stage started
         self._poll_timer    = None
         self._timeout_timer = None
+        self._timing_log    = FlashTimingLog()
 
         self._setup_ui()
         self._start_list_server()
@@ -242,13 +260,21 @@ class CountFactoryStation(QMainWindow):
             f"color:{Colors.TEXT_SECONDARY};font-size:12px;"
         )
 
+        self.lbl_eta = QLabel("")
+        self.lbl_eta.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_eta.setStyleSheet(
+            f"color:{Colors.TEXT_SECONDARY};font-size:11px;"
+        )
+
         vbox.addSpacing(18)
         vbox.addWidget(self.lbl_phase)
         vbox.addSpacing(14)
         vbox.addWidget(pw)
-        vbox.addSpacing(10)
+        vbox.addSpacing(6)
         vbox.addWidget(self.lbl_detail)
-        vbox.addSpacing(18)
+        vbox.addSpacing(2)
+        vbox.addWidget(self.lbl_eta)
+        vbox.addSpacing(14)
         parent.addWidget(body)
 
     def _build_log(self, parent):
@@ -283,6 +309,31 @@ class CountFactoryStation(QMainWindow):
         style = (Styles.get_progress_bar_style(color) if color
                  else Styles.get_progress_bar_style())
         self.progress.setStyleSheet(style)
+
+    def _set_eta(self, text):
+        self.lbl_eta.setText(text)
+
+    def _recalc_progress(self):
+        """Recompute weighted progress and ETA from current dev_progress state."""
+        n_devs = len(self._dev_progress)
+        if n_devs == 0:
+            return
+        tw = sum(self._task_weights) or 1.0  # total weight per device
+        done_work = 0.0
+        for d in self._dev_progress.values():
+            c = min(d["completed"], len(self._task_weights))
+            done_work += sum(self._task_weights[:c])
+            if c < len(self._task_weights):
+                done_work += self._task_weights[c] * d["pct"] / 100.0
+        overall_pct = min(done_work / (tw * n_devs) * 100.0, 99.0)
+        self._set_progress(int(overall_pct))
+
+        elapsed = time.monotonic() - self._stage_t0
+        if elapsed > 3.0 and overall_pct > 1.0:
+            eta_sec = elapsed / (overall_pct / 100.0) - elapsed
+            self._set_eta(_fmt_eta(eta_sec))
+        elif elapsed > 1.0:
+            self._set_eta("ETA: estimating…")
 
     def _log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -342,8 +393,10 @@ class CountFactoryStation(QMainWindow):
             if p.state() != QProcess.ProcessState.NotRunning:
                 p.kill()
         self._processes.clear()
+        self._timing_log.save()
         self._set_phase(P_FAILED)
         self._set_detail(reason)
+        self._set_eta("")
         self._set_progress(0, color=Colors.ERROR)
         self._log(f"FAILED: {reason}")
         self._reset_to_idle()
@@ -373,11 +426,16 @@ class CountFactoryStation(QMainWindow):
         self._set_detail(f"0 / {n} complete")
         self._log(f"Stage {stage}: flashing {n} device(s)")
 
-        self._done_count   = 0
-        self._failed_count = 0
-        self._total_ops    = _count_flash_ops(raw)
-        self._dev_progress = {i: {"completed": 0, "pct": 0.0, "task": ""}
-                              for i in range(n)}
+        self._done_count    = 0
+        self._failed_count  = 0
+        self._flash_tasks   = _parse_flash_tasks(raw)
+        self._total_ops     = len(self._flash_tasks)
+        self._task_weights  = self._timing_log.weights_for(self._flash_tasks)
+        self._stage_t0      = time.monotonic()
+        self._dev_progress  = {
+            i: {"completed": 0, "pct": 0.0, "task": "", "op_t0": None}
+            for i in range(n)
+        }
         self._processes    = []
         wdir = FlashManager.get_working_directory(raw)
 
@@ -404,7 +462,7 @@ class CountFactoryStation(QMainWindow):
         def on_done(code, _status=None):
             ps.close()
             QLocalServer.removeServer(sock_name)
-            self._on_flash_done(code, stage, serial, total)
+            self._on_flash_done(code, stage, serial, total, idx)
 
         ps.newConnection.connect(on_new_conn)
         proc.finished.connect(on_done)
@@ -430,6 +488,7 @@ class CountFactoryStation(QMainWindow):
                 task = msg.get("task", "")
                 pct  = min(float(msg["percent"]), 100.0)
                 dev  = self._dev_progress[idx]
+                now  = time.monotonic()
 
                 # qdl emits one 0→100 sequence per flash operation (per program
                 # entry).  Two cases signal that the previous op completed and a
@@ -446,32 +505,40 @@ class CountFactoryStation(QMainWindow):
                     (task == prev_task and prev_task and pct <= 5.0 and prev_pct >= 95.0)
                 )
                 if new_op:
+                    # Record how long the completed op took
+                    if dev["op_t0"] is not None:
+                        self._timing_log.record(prev_task, now - dev["op_t0"])
                     dev["completed"] += 1
+                    dev["op_t0"] = now
+                elif dev["op_t0"] is None:
+                    dev["op_t0"] = now  # first event for this device
 
                 dev["task"] = task
                 dev["pct"]  = pct
 
-                # Overall progress: (completed_ops + current_pct/100) per device,
-                # normalised by total_ops * n_devices.
-                # Capped at 99 — 100 is only set when all qdl processes exit OK.
-                total_work = self._total_ops * total   # units = full ops
-                done_work  = sum(
-                    d["completed"] + d["pct"] / 100.0
-                    for d in self._dev_progress.values()
-                )
-                self._set_progress(min(int(done_work / total_work * 100), 99))
+                # Weighted progress + ETA (capped at 99 until all procs exit OK)
+                self._recalc_progress()
             except (json.JSONDecodeError, KeyError, ZeroDivisionError):
                 pass
 
-    def _on_flash_done(self, code, stage, serial, total):
+    def _on_flash_done(self, code, stage, serial, total, idx):
         self._done_count += 1
         if code != 0:
             self._failed_count += 1
             self._log(f"  ✗ stage {stage} exit {code}  serial={serial}")
         else:
             self._log(f"  ✓ stage {stage} OK  serial={serial}")
+            # Record timing for the last op and mark device as fully done
+            if idx in self._dev_progress:
+                d = self._dev_progress[idx]
+                now = time.monotonic()
+                if d["op_t0"] is not None and d["task"]:
+                    self._timing_log.record(d["task"], now - d["op_t0"])
+                d["completed"] = self._total_ops
+                d["pct"] = 100.0
+                d["op_t0"] = None
         self._set_detail(f"{self._done_count} / {total} complete")
-        self._set_progress(self._done_count, total)
+        self._recalc_progress()
 
         if self._done_count < total:
             return  # still waiting for other devices
@@ -491,8 +558,10 @@ class CountFactoryStation(QMainWindow):
         self._log(
             f"Stage 1 complete — waiting for {self._device_count} device(s) in ADB"
         )
+        self._timing_log.save()
         self._set_phase(P_BOOTING)
         self._set_progress(0, spin=True)
+        self._set_eta("")
         self._set_detail(f"0 / {self._device_count} in ADB")
 
         self._poll_timer = QTimer()
@@ -574,8 +643,10 @@ class CountFactoryStation(QMainWindow):
     # ── Done ─────────────────────────────────────────────────────────────────
 
     def _enter_done(self):
+        self._timing_log.save()
         self._set_phase(P_DONE)
         self._set_progress(100, color=Colors.SUCCESS)
+        self._set_eta("")
         self._set_detail(f"All {self._device_count} device(s) complete")
         self._log(f"Run complete — {self._device_count} device(s) DONE")
         self._reset_to_idle()
