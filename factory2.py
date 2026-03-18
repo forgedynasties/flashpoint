@@ -141,14 +141,16 @@ class CountFactoryStation(QMainWindow):
         self._processes     = []      # active QProcess instances this stage
         self._done_count    = 0       # flash completions this stage
         self._failed_count  = 0
-        self._total_ops     = 1       # flash ops per firmware (from rawprogram.xml)
-        self._flash_tasks   = ["unknown"]  # ordered task labels from rawprogram.xml
-        self._task_weights  = [1.0]        # duration-proportional weight per task
-        self._dev_progress  = {}      # idx → {completed, pct, task, op_t0}
-        self._stage_t0      = 0.0     # monotonic time when flash stage started
-        self._poll_timer    = None
-        self._timeout_timer = None
-        self._timing_log    = FlashTimingLog()
+        self._total_ops          = 1    # flash ops per firmware (from rawprogram.xml)
+        self._flash_tasks        = []   # task labels from rawprogram.xml (for op count)
+        self._dev_progress       = {}   # idx → {completed, pct, task}
+        self._stage_t0           = 0.0  # monotonic time when flash stage started
+        self._stage_key          = ""   # "factory" or "prod"
+        self._stage_expected_total = 0.0  # avg total duration from timing log
+        self._poll_timer         = None
+        self._timeout_timer      = None
+        self._progress_timer     = None
+        self._timing_log         = FlashTimingLog()
 
         self._setup_ui()
         self._start_list_server()
@@ -314,26 +316,28 @@ class CountFactoryStation(QMainWindow):
         self.lbl_eta.setText(text)
 
     def _recalc_progress(self):
-        """Recompute weighted progress and ETA from current dev_progress state."""
-        n_devs = len(self._dev_progress)
-        if n_devs == 0:
-            return
-        tw = sum(self._task_weights) or 1.0  # total weight per device
-        done_work = 0.0
-        for d in self._dev_progress.values():
-            c = min(d["completed"], len(self._task_weights))
-            done_work += sum(self._task_weights[:c])
-            if c < len(self._task_weights):
-                done_work += self._task_weights[c] * d["pct"] / 100.0
-        overall_pct = min(done_work / (tw * n_devs) * 100.0, 99.0)
-        self._set_progress(int(overall_pct))
-
+        """Update progress bar and ETA. Time-based when history exists, else op-based."""
         elapsed = time.monotonic() - self._stage_t0
-        if elapsed > 3.0 and overall_pct > 1.0:
-            eta_sec = elapsed / (overall_pct / 100.0) - elapsed
+
+        if self._stage_expected_total > 0:
+            # Time-based: linear by definition
+            pct = min(elapsed / self._stage_expected_total * 100.0, 99.0)
+            self._set_progress(int(pct))
+            eta_sec = max(self._stage_expected_total - elapsed, 0.0)
             self._set_eta(_fmt_eta(eta_sec))
-        elif elapsed > 1.0:
-            self._set_eta("ETA: estimating…")
+        else:
+            # First run — no timing data yet; fall back to uniform per-op progress
+            n_devs = len(self._dev_progress)
+            total_work = self._total_ops * n_devs
+            if total_work > 0:
+                done_work = sum(
+                    d["completed"] + d["pct"] / 100.0
+                    for d in self._dev_progress.values()
+                )
+                pct = min(int(done_work / total_work * 100), 99)
+                self._set_progress(pct)
+            if elapsed > 3.0:
+                self._set_eta("ETA: no data yet — will estimate after first run")
 
     def _log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -341,7 +345,7 @@ class CountFactoryStation(QMainWindow):
         log.info(msg)
 
     def _stop_phase_timers(self):
-        for attr in ("_poll_timer", "_timeout_timer"):
+        for attr in ("_poll_timer", "_timeout_timer", "_progress_timer"):
             t = getattr(self, attr, None)
             if t:
                 t.stop()
@@ -428,17 +432,18 @@ class CountFactoryStation(QMainWindow):
 
         self._done_count    = 0
         self._failed_count  = 0
-        self._stage_prefix  = f"s{stage}:"
-        self._flash_tasks   = [
-            f"{self._stage_prefix}{t}" for t in _parse_flash_tasks(raw)
-        ]
+        self._flash_tasks   = _parse_flash_tasks(raw)
         self._total_ops     = len(self._flash_tasks)
-        self._task_weights  = self._timing_log.weights_for(self._flash_tasks)
+        self._stage_key     = "factory" if stage == 1 else "prod"
+        self._stage_expected_total = self._timing_log.avg_total(self._stage_key)
         self._stage_t0      = time.monotonic()
         self._dev_progress  = {
-            i: {"completed": 0, "pct": 0.0, "task": "", "op_t0": None}
+            i: {"completed": 0, "pct": 0.0, "task": ""}
             for i in range(n)
         }
+        self._progress_timer = QTimer()
+        self._progress_timer.timeout.connect(self._recalc_progress)
+        self._progress_timer.start(500)
         self._processes    = []
         wdir = FlashManager.get_working_directory(raw)
 
@@ -493,7 +498,6 @@ class CountFactoryStation(QMainWindow):
                 task = msg.get("task", "")
                 pct  = min(float(msg["percent"]), 100.0)
                 dev  = self._dev_progress[idx]
-                now  = time.monotonic()
 
                 # qdl emits one 0→100 sequence per flash operation (per program
                 # entry).  Two cases signal that the previous op completed and a
@@ -510,18 +514,11 @@ class CountFactoryStation(QMainWindow):
                     (task == prev_task and prev_task and pct <= 5.0 and prev_pct >= 95.0)
                 )
                 if new_op:
-                    # Record how long the completed op took
-                    if dev["op_t0"] is not None:
-                        self._timing_log.record(prev_task, now - dev["op_t0"])
                     dev["completed"] += 1
-                    dev["op_t0"] = now
-                elif dev["op_t0"] is None:
-                    dev["op_t0"] = now  # first event for this device
 
                 dev["task"] = task
                 dev["pct"]  = pct
 
-                # Weighted progress + ETA (capped at 99 until all procs exit OK)
                 self._recalc_progress()
             except (json.JSONDecodeError, KeyError, ZeroDivisionError):
                 pass
@@ -533,15 +530,10 @@ class CountFactoryStation(QMainWindow):
             self._log(f"  ✗ stage {stage} exit {code}  serial={serial}")
         else:
             self._log(f"  ✓ stage {stage} OK  serial={serial}")
-            # Record timing for the last op and mark device as fully done
             if idx in self._dev_progress:
                 d = self._dev_progress[idx]
-                now = time.monotonic()
-                if d["op_t0"] is not None and d["task"]:
-                    self._timing_log.record(d["task"], now - d["op_t0"])
                 d["completed"] = self._total_ops
                 d["pct"] = 100.0
-                d["op_t0"] = None
         self._set_detail(f"{self._done_count} / {total} complete")
         self._recalc_progress()
 
@@ -563,6 +555,7 @@ class CountFactoryStation(QMainWindow):
         self._log(
             f"Stage 1 complete — waiting for {self._device_count} device(s) in ADB"
         )
+        self._timing_log.record_total(self._stage_key, time.monotonic() - self._stage_t0)
         self._timing_log.save()
         self._set_phase(P_BOOTING)
         self._set_progress(0, spin=True)
@@ -650,6 +643,7 @@ class CountFactoryStation(QMainWindow):
     # ── Done ─────────────────────────────────────────────────────────────────
 
     def _enter_done(self):
+        self._timing_log.record_total(self._stage_key, time.monotonic() - self._stage_t0)
         self._timing_log.save()
         self._set_phase(P_DONE)
         self._set_progress(100, color=Colors.SUCCESS)

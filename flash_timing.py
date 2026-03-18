@@ -56,3 +56,12 @@ class FlashTimingLog:
     def weights_for(self, tasks: list[str]) -> list[float]:
         """Return duration-proportional weight for each task (same order)."""
         return [self.avg_duration(t) for t in tasks]
+
+    def record_total(self, stage_key: str, seconds: float):
+        """Record total elapsed time for a complete flash stage."""
+        self.record(f"_total_{stage_key}", seconds)
+
+    def avg_total(self, stage_key: str) -> float:
+        """Return average total duration for a flash stage, 0.0 if no data."""
+        s = self._data.get(f"_total_{stage_key}", [])
+        return sum(s) / len(s) if s else 0.0
