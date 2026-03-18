@@ -428,7 +428,10 @@ class CountFactoryStation(QMainWindow):
 
         self._done_count    = 0
         self._failed_count  = 0
-        self._flash_tasks   = _parse_flash_tasks(raw)
+        self._stage_prefix  = f"s{stage}:"
+        self._flash_tasks   = [
+            f"{self._stage_prefix}{t}" for t in _parse_flash_tasks(raw)
+        ]
         self._total_ops     = len(self._flash_tasks)
         self._task_weights  = self._timing_log.weights_for(self._flash_tasks)
         self._stage_t0      = time.monotonic()
