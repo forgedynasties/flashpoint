@@ -24,6 +24,7 @@ from flash_timing import FlashTimingLog
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QProgressBar, QTextEdit, QApplication,
+    QDialog,
 )
 from PyQt6.QtCore import QTimer, Qt, QProcess
 from PyQt6.QtNetwork import QLocalServer
@@ -145,6 +146,7 @@ class CountFactoryStation(QMainWindow):
         self._flash_tasks        = []   # task labels from rawprogram.xml (for op count)
         self._dev_progress       = {}   # idx → {completed, pct, task}
         self._stage_t0           = 0.0  # monotonic time when flash stage started
+        self._cycle_t0           = 0.0  # monotonic time when Start was pressed
         self._stage_key          = ""   # "factory" or "prod"
         self._stage_expected_total = 0.0  # avg total duration from timing log
         self._poll_timer         = None
@@ -376,6 +378,7 @@ class CountFactoryStation(QMainWindow):
         self.btn_start.setEnabled(False)
         self.btn_start.setText("Running…")
         self.btn_stop.setEnabled(True)
+        self._cycle_t0 = time.monotonic()
         self._log(f"Run started — {self._device_count} device(s) in EDL")
         self._flash_stage(serials, stage=1)
 
@@ -652,8 +655,54 @@ class CountFactoryStation(QMainWindow):
         self._set_progress(100, color=Colors.SUCCESS)
         self._set_eta("")
         self._set_detail(f"All {self._device_count} device(s) complete")
-        self._log(f"Run complete — {self._device_count} device(s) DONE")
+        elapsed = time.monotonic() - self._cycle_t0
+        self._log(f"Run complete — {self._device_count} device(s) DONE in {_fmt_eta(elapsed).replace('ETA: ', '')}")
         self._reset_to_idle()
+        self._show_done_dialog(elapsed)
+
+    def _show_done_dialog(self, elapsed_sec: float):
+        m, s = divmod(int(elapsed_sec), 60)
+        time_str = f"{m}m {s:02d}s" if m else f"{s}s"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Cycle Complete")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(340)
+        dlg.setStyleSheet(
+            f"background:{Colors.BG_SURFACE};"
+            f"color:{Colors.TEXT_PRIMARY};"
+        )
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(32, 28, 32, 24)
+        layout.setSpacing(16)
+
+        icon = QLabel("✓")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet(f"color:{Colors.SUCCESS};font-size:48px;font-weight:700;")
+
+        title = QLabel(f"{self._device_count} device{'s' if self._device_count != 1 else ''} flashed successfully")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setWordWrap(True)
+        title.setStyleSheet(f"color:{Colors.WHITE};font-size:15px;font-weight:700;")
+
+        time_lbl = QLabel(f"Total time: {time_str}")
+        time_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        time_lbl.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:13px;")
+
+        btn = QPushButton("Start New Cycle")
+        btn.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
+        btn.setFixedHeight(38)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(dlg.accept)
+
+        layout.addWidget(icon)
+        layout.addWidget(title)
+        layout.addWidget(time_lbl)
+        layout.addSpacing(8)
+        layout.addWidget(btn)
+
+        dlg.exec()
 
 
 def main():
