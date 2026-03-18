@@ -378,12 +378,6 @@ class CountFactoryStation(QMainWindow):
         self.btn_start.setEnabled(False)
         self.btn_start.setText("Running…")
         self.btn_stop.setEnabled(True)
-        # Reset view for new cycle
-        self.log_box.clear()
-        self._set_phase(P_IDLE)
-        self._set_progress(0)
-        self._set_detail("")
-        self._set_eta("")
         self._cycle_t0 = time.monotonic()
         self._log(f"Run started — {self._device_count} device(s) in EDL")
         self._flash_stage(serials, stage=1)
@@ -709,6 +703,12 @@ class CountFactoryStation(QMainWindow):
         layout.addWidget(btn)
 
         dlg.exec()
+        # Reset view immediately after dialog is dismissed
+        self.log_box.clear()
+        self._set_phase(P_IDLE)
+        self._set_progress(0)
+        self._set_detail("Waiting for EDL devices…")
+        self._set_eta("")
 
 
 def main():
