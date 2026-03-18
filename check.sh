@@ -12,8 +12,8 @@ BOLD='\033[1m'; NC='\033[0m'
 
 PASS=0; FAIL=0
 
-_ok()   { echo -e "  ${GREEN}✓${NC}  $1"; ((PASS++)); }
-_fail() { echo -e "  ${RED}✗${NC}  $1"; ((FAIL++)); }
+_ok()   { echo -e "  ${GREEN}✓${NC}  $1"; PASS=$((PASS + 1)); }
+_fail() { echo -e "  ${RED}✗${NC}  $1"; FAIL=$((FAIL + 1)); }
 _warn() { echo -e "  ${YELLOW}!${NC}  $1"; }
 _hdr()  { echo -e "\n${BOLD}$1${NC}"; }
 
