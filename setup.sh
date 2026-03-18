@@ -75,7 +75,8 @@ if [[ -f "$PREBUILT" ]]; then
     echo "      Installed to $QDL_INSTALL_PATH"
 elif [[ -d "$QDL_SRC" && -f "$QDL_SRC/Makefile" ]]; then
     echo "      Building from source: $QDL_SRC"
-    make -C "$QDL_SRC" -j"$(nproc)" clean default
+    make -C "$QDL_SRC" clean
+    make -C "$QDL_SRC" -j"$(nproc)"
     install -m 755 "$QDL_SRC/qdl" "$QDL_INSTALL_PATH"
     echo "      Built and installed to $QDL_INSTALL_PATH"
 else
