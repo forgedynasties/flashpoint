@@ -472,7 +472,9 @@ class CountFactoryStation(QMainWindow):
         proc.readyReadStandardOutput.connect(lambda: proc.readAllStandardOutput())
 
         args = FlashManager.build_flash_command(
-            serial, prog, raw, patch, progress_socket=sock_path
+            serial, prog, raw, patch,
+            progress_socket=sock_path,
+            allow_fusing=(stage == 3),
         )
         proc.setWorkingDirectory(wdir)
         proc.start(args[0], args[1:])
@@ -573,12 +575,14 @@ class CountFactoryStation(QMainWindow):
 
         self._timeout_timer = QTimer()
         self._timeout_timer.setSingleShot(True)
-        self._timeout_timer.timeout.connect(
-            lambda: self._set_failed(
-                f"Boot timeout after {self.boot_timeout_ms // 1000}s"
-            )
-        )
+        self._timeout_timer.timeout.connect(self._boot_timeout)
         self._timeout_timer.start(self.boot_timeout_ms)
+
+    def _boot_timeout(self):
+        n = len(_adb_transport_ids())
+        self._set_failed(
+            f"Boot timeout: only {n}/{self._device_count} device(s) returned to ADB"
+        )
 
     def _check_adb(self):
         tids = _adb_transport_ids()

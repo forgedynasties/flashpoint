@@ -43,7 +43,7 @@ class FlashManager:
             return False
     
     @staticmethod
-    def build_flash_command(serial, prog, raw, patch, progress_socket=None):
+    def build_flash_command(serial, prog, raw, patch, progress_socket=None, allow_fusing=False):
         """Build the QDL flash command.
 
         Args:
@@ -52,6 +52,7 @@ class FlashManager:
             raw: Path to raw file
             patch: Path to patch file
             progress_socket: Optional Unix socket path for JSON progress events
+            allow_fusing: Pass --allow-fusing to qdl (required for debug firmware)
 
         Returns:
             list: Command arguments for subprocess
@@ -67,6 +68,8 @@ class FlashManager:
             os.path.basename(patch),
             "-u", "1048576",
         ]
+        if allow_fusing:
+            cmd.append("--allow-fusing")
         if progress_socket:
             cmd.extend(["--progress-socket", progress_socket])
             log.debug("Flash command includes progress socket: %s", progress_socket)
