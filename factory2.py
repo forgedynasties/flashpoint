@@ -557,6 +557,9 @@ class CountFactoryStation(QMainWindow):
         )
         self._timing_log.record_total(self._stage_key, time.monotonic() - self._stage_t0)
         self._timing_log.save()
+        if self._progress_timer:
+            self._progress_timer.stop()
+            self._progress_timer = None
         self._set_phase(P_BOOTING)
         self._set_progress(0, spin=True)
         self._set_eta("")
