@@ -99,13 +99,16 @@ _PHASE_COLOR = {
 # ── Count-only helpers ───────────────────────────────────────────────────────
 
 def _edl_serials():
-    """Return list of QDL serials by running `qdl list`."""
+    """Return list of QDL serials by running `qdl list`.
+
+    Output format: <vid>:<pid>\t<serial>  (one device per line, no header)
+    """
     try:
         out = subprocess.check_output(
             ["sudo", QDL_BIN, "list"], stderr=subprocess.DEVNULL, timeout=5
         ).decode()
         serials = []
-        for line in out.splitlines()[1:]:  # skip header row
+        for line in out.splitlines():
             parts = line.split()
             if len(parts) >= 2:
                 serials.append(parts[1])
@@ -165,7 +168,7 @@ class CountFactoryStation(QMainWindow):
         self._setup_ui()
         self._idle_timer = QTimer()
         self._idle_timer.timeout.connect(self._idle_tick)
-        self._idle_timer.start(SCAN_INTERVAL_MS)
+        self._idle_timer.start(1000)
 
     def closeEvent(self, event):
         super().closeEvent(event)
