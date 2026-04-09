@@ -512,7 +512,15 @@ class CountFactoryStation(QMainWindow):
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if msg.get("event") != "progress":
+            event = msg.get("event")
+
+            if event == "info":
+                self._log(f"  [qdl] {msg.get('message', '').strip()}")
+                continue
+            if event == "error":
+                self._log(f"  [qdl ERR] {msg.get('message', '').strip()}")
+                continue
+            if event != "progress":
                 continue
 
             task = msg.get("task", "")
