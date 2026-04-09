@@ -217,10 +217,8 @@ class CountFactoryStation(QMainWindow):
         self._cycle_t0     = 0.0  # monotonic time when Start was pressed
         self._poll_timer   = None
         self._timeout_timer = None
-        # Per-device byte-accurate progress (shared across all devices in a stage)
-        self._ops          = []   # [(label, bytes)] ordered list for current stage
-        self._total_bytes  = 0    # sum of all op bytes for current stage
-        # Per-device progress state: idx → {op_idx, bytes_done, cur_pct, prev_pct, prev_task}
+        self._total_ops    = 0    # total flash ops for current stage (from rawprogram scan)
+        # Per-device progress: idx → {serial, ops_done}
         self._dev_progress = {}
 
         self._setup_ui()
@@ -450,9 +448,9 @@ class CountFactoryStation(QMainWindow):
             return
 
         wdir = FlashManager.get_working_directory(raw)
-        self._ops, self._total_bytes = _scan_flash_ops(raw, wdir)
-        log.info("Stage %d: %d ops, %d MB total",
-                 stage, len(self._ops), self._total_bytes // 1_000_000)
+        ops, _ = _scan_flash_ops(raw, wdir)
+        self._total_ops = len(ops)
+        log.info("Stage %d: %d ops", stage, self._total_ops)
 
         n = len(serials)
         self._set_phase(phase)
@@ -463,9 +461,8 @@ class CountFactoryStation(QMainWindow):
         self._done_count   = 0
         self._failed_count = 0
         self._processes    = []
-        # Per-device progress state
         self._dev_progress = {
-            i: {"op_idx": 0, "bytes_done": 0, "cur_pct": 0.0, "prev_pct": 0.0, "prev_task": ""}
+            i: {"serial": serials[i], "ops_done": 0}
             for i in range(n)
         }
 
@@ -504,6 +501,8 @@ class CountFactoryStation(QMainWindow):
         proc.start(args[0], args[1:])
         log.info("Stage %d: qdl started for serial=%s", stage, serial)
 
+    _FLASHED_RE = re.compile(r'^flashed ".+?" successfully')
+
     def _on_progress(self, sock, dev_idx):
         data = bytes(sock.readAll()).decode(errors="replace")
         for line in data.splitlines():
@@ -514,68 +513,33 @@ class CountFactoryStation(QMainWindow):
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            event = msg.get("event")
+            event   = msg.get("event")
+            message = msg.get("message", "").strip()
 
             if event == "info":
-                self._log(f"  [qdl] {msg.get('message', '').strip()}")
-                continue
-            if event == "error":
-                self._log(f"  [qdl ERR] {msg.get('message', '').strip()}")
-                continue
-            if event != "progress":
-                continue
-
-            task = msg.get("task", "")
-            pct  = min(float(msg.get("percent", 0)), 100.0)
-
-            if dev_idx not in self._dev_progress or not self._ops:
-                continue
-
-            dev = self._dev_progress[dev_idx]
-            op_idx     = dev["op_idx"]
-            prev_pct   = dev["prev_pct"]
-            prev_task  = dev["prev_task"]
-
-            # Detect op boundary:
-            #   1. Task label changed        → previous op finished
-            #   2. Same label, pct regressed significantly → sparse chunk boundary
-            op_done = (
-                (prev_task and task != prev_task) or
-                (prev_task and task == prev_task and pct < 10.0 and prev_pct > 80.0)
-            )
-            if op_done and op_idx < len(self._ops):
-                dev["bytes_done"] += self._ops[op_idx][1]
-                op_idx += 1
-                dev["op_idx"] = op_idx
-
-            dev["prev_task"] = task
-            dev["prev_pct"]  = pct
-            dev["cur_pct"]   = pct
-
-            self._update_overall_progress()
+                self._log(f"  [qdl] {message}")
+                if self._FLASHED_RE.match(message) and dev_idx in self._dev_progress:
+                    self._dev_progress[dev_idx]["ops_done"] += 1
+                    self._update_overall_progress()
+            elif event == "error":
+                self._log(f"  [qdl ERR] {message}")
 
     def _update_overall_progress(self):
-        if not self._total_bytes or not self._dev_progress:
+        if not self._total_ops or not self._dev_progress:
             return
-        total_done = 0
-        for dev in self._dev_progress.values():
-            op_idx = dev["op_idx"]
-            if op_idx < len(self._ops):
-                total_done += dev["bytes_done"] + self._ops[op_idx][1] * dev["cur_pct"] / 100.0
-            else:
-                total_done += dev["bytes_done"]
-        # Average across all devices
-        avg_done = total_done / len(self._dev_progress)
-        pct = int(avg_done / self._total_bytes * 100)
-        self._set_progress(min(pct, 99))  # hold at 99 until fully done
+        n             = len(self._dev_progress)
+        done_ops_all  = sum(d["ops_done"] for d in self._dev_progress.values())
+        pct           = int(done_ops_all / (self._total_ops * n) * 100)
+        parts = [
+            f"{d['serial']}: {d['ops_done']}/{self._total_ops}"
+            for d in self._dev_progress.values()
+        ]
+        self._set_detail("  |  ".join(parts))
+        self._set_progress(min(pct, 99))
 
     def _on_flash_done(self, code, stage, serial, total, idx):
-        # Mark this device's progress as complete
         if idx in self._dev_progress:
-            dev = self._dev_progress[idx]
-            dev["bytes_done"] = self._total_bytes
-            dev["op_idx"]     = len(self._ops)
-            dev["cur_pct"]    = 100.0
+            self._dev_progress[idx]["ops_done"] = self._total_ops
         self._update_overall_progress()
 
         self._done_count += 1
@@ -584,7 +548,6 @@ class CountFactoryStation(QMainWindow):
             self._log(f"  ✗ stage {stage} exit {code}  serial={serial}")
         else:
             self._log(f"  ✓ stage {stage} OK  serial={serial}")
-        self._set_detail(f"{self._done_count} / {total} complete")
 
         if self._done_count < total:
             return
