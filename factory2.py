@@ -8,26 +8,30 @@ Pipeline:
   5. Flash all again
   6. Done
 """
+import json
 import logging
 import os
 import re
+import struct
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QTextEdit, QApplication,
+    QPushButton, QLabel, QProgressBar, QTextEdit, QApplication,
     QDialog,
 )
 from PyQt6.QtCore import QTimer, Qt, QProcess
+from PyQt6.QtNetwork import QLocalServer
 
 from config import (
     SCAN_INTERVAL_MS,
     FACTORY_FW_PATH_ENV, PROD_DEBUG_FW_PATH_ENV,
     BOOT_TIMEOUT_SEC_ENV, DEFAULT_BOOT_TIMEOUT_SEC,
     EXPECTED_BUILD_ID,
-    QDL_BIN,
+    QDL_BIN, QDL_PROGRESS_SOCK_PREFIX,
 )
 from styles import Styles, Colors
 from utils_device_manager import DeviceScanner
@@ -41,6 +45,94 @@ EDL_RETURN_TIMEOUT_MS = 60_000   # 60 s for devices to return to EDL after reboo
 def _fmt_elapsed(sec: float) -> str:
     m, s = divmod(int(sec), 60)
     return f"{m}m {s:02d}s" if m else f"{s}s"
+
+
+# ── Sparse image helpers ─────────────────────────────────────────────────────
+
+_SPARSE_MAGIC      = 0xED26FF3A
+_CHUNK_TYPE_RAW    = 0xCAC1
+_CHUNK_TYPE_FILL   = 0xCAC2
+_CHUNK_TYPE_DONT_CARE = 0xCAC3
+_SPARSE_HDR_FMT    = "<IHHHHIIIi"   # 28 bytes
+_CHUNK_HDR_FMT     = "<HHII"        # 12 bytes
+
+
+def _sparse_write_chunks(filepath):
+    """Return list of byte sizes for each write op qdl will perform on this sparse image.
+
+    RAW and FILL chunks each become one write op. DONT_CARE are skipped.
+    Returns None if the file is not a valid sparse image.
+    """
+    hdr_size   = struct.calcsize(_SPARSE_HDR_FMT)
+    chunk_size = struct.calcsize(_CHUNK_HDR_FMT)
+    ops = []
+    try:
+        with open(filepath, "rb") as f:
+            raw = f.read(hdr_size)
+            if len(raw) < hdr_size:
+                return None
+            magic, major, _minor, file_hdr_sz, chunk_hdr_sz, blk_sz, _total_blks, total_chunks, _crc = \
+                struct.unpack(_SPARSE_HDR_FMT, raw)
+            if magic != _SPARSE_MAGIC or major != 1:
+                return None
+            if file_hdr_sz > hdr_size:
+                f.seek(file_hdr_sz - hdr_size, 1)
+            for _ in range(total_chunks):
+                raw_chunk = f.read(chunk_size)
+                if len(raw_chunk) < chunk_size:
+                    break
+                chunk_type, _res, chunk_sz, _total_sz = struct.unpack(_CHUNK_HDR_FMT, raw_chunk)
+                data_bytes = chunk_sz * blk_sz
+                if chunk_hdr_sz > chunk_size:
+                    f.seek(chunk_hdr_sz - chunk_size, 1)
+                if chunk_type == _CHUNK_TYPE_RAW:
+                    ops.append(data_bytes)
+                    f.seek(data_bytes, 1)
+                elif chunk_type == _CHUNK_TYPE_FILL:
+                    ops.append(data_bytes)
+                    f.seek(4, 1)
+                elif chunk_type == _CHUNK_TYPE_DONT_CARE:
+                    pass
+    except Exception:
+        return None
+    return ops or None
+
+
+def _scan_flash_ops(raw_xml_path, fw_dir):
+    """Parse rawprogram.xml and return the exact ordered list of (label, bytes) that qdl will execute.
+
+    Sparse images are expanded into their individual RAW/FILL chunk ops.
+    Returns (ops_list, total_bytes). ops_list is [(label, bytes), ...].
+    """
+    ops = []
+    try:
+        tree = ET.parse(raw_xml_path)
+        for p in tree.findall(".//program"):
+            filename = (p.get("filename") or "").strip()
+            if not filename:
+                continue
+            label = (p.get("label") or p.get("LABEL") or "").strip() or filename
+            is_sparse = (p.get("sparse") or "").lower() == "true"
+            sector_size = int(p.get("SECTOR_SIZE_IN_BYTES") or 4096)
+            num_sectors = int(p.get("num_partition_sectors") or 0)
+
+            filepath = os.path.join(fw_dir, os.path.basename(filename))
+
+            if is_sparse:
+                chunks = _sparse_write_chunks(filepath)
+                if chunks:
+                    for b in chunks:
+                        ops.append((label, b))
+                    continue
+
+            # Non-sparse (or sparse parse failed): one op, size from XML
+            if num_sectors:
+                ops.append((label, num_sectors * sector_size))
+    except Exception as exc:
+        log.warning("Could not scan flash ops: %s", exc)
+
+    total_bytes = sum(b for _, b in ops)
+    return ops, total_bytes
 
 
 # ── Phase constants ──────────────────────────────────────────────────────────
@@ -123,6 +215,11 @@ class CountFactoryStation(QMainWindow):
         self._cycle_t0     = 0.0  # monotonic time when Start was pressed
         self._poll_timer   = None
         self._timeout_timer = None
+        # Per-device byte-accurate progress (shared across all devices in a stage)
+        self._ops          = []   # [(label, bytes)] ordered list for current stage
+        self._total_bytes  = 0    # sum of all op bytes for current stage
+        # Per-device progress state: idx → {op_idx, bytes_done, cur_pct, prev_pct, prev_task}
+        self._dev_progress = {}
 
         self._setup_ui()
 
@@ -208,6 +305,17 @@ class CountFactoryStation(QMainWindow):
             f"color:{_PHASE_COLOR[P_IDLE]};font-size:28px;font-weight:700;"
         )
 
+        pw = QWidget()
+        pl = QHBoxLayout(pw)
+        pl.setContentsMargins(80, 0, 80, 0)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        self.progress.setFixedHeight(30)
+        self.progress.setStyleSheet(Styles.get_progress_bar_style())
+        pl.addWidget(self.progress)
+
         self.lbl_detail = QLabel("Waiting for EDL devices…")
         self.lbl_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_detail.setStyleSheet(
@@ -217,6 +325,8 @@ class CountFactoryStation(QMainWindow):
         vbox.addSpacing(18)
         vbox.addWidget(self.lbl_phase)
         vbox.addSpacing(14)
+        vbox.addWidget(pw)
+        vbox.addSpacing(6)
         vbox.addWidget(self.lbl_detail)
         vbox.addSpacing(18)
         parent.addWidget(body)
@@ -243,6 +353,15 @@ class CountFactoryStation(QMainWindow):
 
     def _set_detail(self, text):
         self.lbl_detail.setText(text)
+
+    def _set_progress(self, value, *, spin=False, color=None):
+        if spin:
+            self.progress.setRange(0, 0)
+        else:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(max(0, min(100, value)))
+        style = Styles.get_progress_bar_style(color) if color else Styles.get_progress_bar_style()
+        self.progress.setStyleSheet(style)
 
     def _log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -293,6 +412,7 @@ class CountFactoryStation(QMainWindow):
                 p.kill()
         self._processes.clear()
         self._set_phase(P_FAILED)
+        self._set_progress(0, color=Colors.ERROR)
         self._set_detail("Stopped by operator")
         self._reset_to_idle()
 
@@ -303,6 +423,7 @@ class CountFactoryStation(QMainWindow):
                 p.kill()
         self._processes.clear()
         self._set_phase(P_FAILED)
+        self._set_progress(0, color=Colors.ERROR)
         self._set_detail(reason)
         self._log(f"FAILED: {reason}")
         self._reset_to_idle()
@@ -326,15 +447,25 @@ class CountFactoryStation(QMainWindow):
             self._set_failed(f"Stage {stage} firmware not found in: {fw_path!r}")
             return
 
+        wdir = FlashManager.get_working_directory(raw)
+        self._ops, self._total_bytes = _scan_flash_ops(raw, wdir)
+        log.info("Stage %d: %d ops, %d MB total",
+                 stage, len(self._ops), self._total_bytes // 1_000_000)
+
         n = len(serials)
         self._set_phase(phase)
+        self._set_progress(0)
         self._set_detail(f"Flashing {n} device(s)…")
         self._log(f"Stage {stage}: flashing {n} device(s)")
 
         self._done_count   = 0
         self._failed_count = 0
         self._processes    = []
-        wdir = FlashManager.get_working_directory(raw)
+        # Per-device progress state
+        self._dev_progress = {
+            i: {"op_idx": 0, "bytes_done": 0, "cur_pct": 0.0, "prev_pct": 0.0, "prev_task": ""}
+            for i in range(n)
+        }
 
         for idx, serial in enumerate(serials):
             self._launch_one(serial, stage, idx, n, prog, raw, patch, wdir)
@@ -343,21 +474,100 @@ class CountFactoryStation(QMainWindow):
         proc = QProcess()
         self._processes.append(proc)
 
-        def on_done(code, _status=None):
-            self._on_flash_done(code, stage, serial, total)
+        sock_name = f"{QDL_PROGRESS_SOCK_PREFIX}f{stage}-{idx}"
+        QLocalServer.removeServer(sock_name)
+        ps = QLocalServer()
+        ps.listen(sock_name)
 
+        def on_new_conn():
+            sock = ps.nextPendingConnection()
+            if sock:
+                sock.readyRead.connect(lambda: self._on_progress(sock, idx))
+
+        def on_done(code, _status=None):
+            ps.close()
+            QLocalServer.removeServer(sock_name)
+            self._on_flash_done(code, stage, serial, total, idx)
+
+        ps.newConnection.connect(on_new_conn)
         proc.finished.connect(on_done)
         proc.readyReadStandardOutput.connect(lambda: proc.readAllStandardOutput())
 
         args = FlashManager.build_flash_command(
             serial, prog, raw, patch,
+            progress_socket=ps.fullServerName(),
             allow_fusing=(stage == 3),
         )
         proc.setWorkingDirectory(wdir)
         proc.start(args[0], args[1:])
         log.info("Stage %d: qdl started for serial=%s", stage, serial)
 
-    def _on_flash_done(self, code, stage, serial, total):
+    def _on_progress(self, sock, dev_idx):
+        data = bytes(sock.readAll()).decode(errors="replace")
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("event") != "progress":
+                continue
+
+            task = msg.get("task", "")
+            pct  = min(float(msg.get("percent", 0)), 100.0)
+
+            if dev_idx not in self._dev_progress or not self._ops:
+                continue
+
+            dev = self._dev_progress[dev_idx]
+            op_idx     = dev["op_idx"]
+            prev_pct   = dev["prev_pct"]
+            prev_task  = dev["prev_task"]
+
+            # Detect op boundary:
+            #   1. Task label changed        → previous op finished
+            #   2. Same label, pct regressed significantly → sparse chunk boundary
+            op_done = (
+                (prev_task and task != prev_task) or
+                (prev_task and task == prev_task and pct < 10.0 and prev_pct > 80.0)
+            )
+            if op_done and op_idx < len(self._ops):
+                dev["bytes_done"] += self._ops[op_idx][1]
+                op_idx += 1
+                dev["op_idx"] = op_idx
+
+            dev["prev_task"] = task
+            dev["prev_pct"]  = pct
+            dev["cur_pct"]   = pct
+
+            self._update_overall_progress()
+
+    def _update_overall_progress(self):
+        if not self._total_bytes or not self._dev_progress:
+            return
+        total_done = 0
+        for dev in self._dev_progress.values():
+            op_idx = dev["op_idx"]
+            if op_idx < len(self._ops):
+                total_done += dev["bytes_done"] + self._ops[op_idx][1] * dev["cur_pct"] / 100.0
+            else:
+                total_done += dev["bytes_done"]
+        # Average across all devices
+        avg_done = total_done / len(self._dev_progress)
+        pct = int(avg_done / self._total_bytes * 100)
+        self._set_progress(min(pct, 99))  # hold at 99 until fully done
+
+    def _on_flash_done(self, code, stage, serial, total, idx):
+        # Mark this device's progress as complete
+        if idx in self._dev_progress:
+            dev = self._dev_progress[idx]
+            dev["bytes_done"] = self._total_bytes
+            dev["op_idx"]     = len(self._ops)
+            dev["cur_pct"]    = 100.0
+        self._update_overall_progress()
+
         self._done_count += 1
         if code != 0:
             self._failed_count += 1
@@ -385,6 +595,7 @@ class CountFactoryStation(QMainWindow):
             f"Stage 1 complete — waiting for {self._device_count} device(s) in ADB"
         )
         self._set_phase(P_BOOTING)
+        self._set_progress(0, spin=True)
         self._set_detail(f"0 / {self._device_count} in ADB")
 
         self._poll_timer = QTimer()
@@ -438,6 +649,7 @@ class CountFactoryStation(QMainWindow):
 
     def _enter_rebooting(self, tids):
         self._set_phase(P_TO_EDL)
+        self._set_progress(0, spin=True)
         self._set_detail(f"Rebooting {len(tids)} device(s) to EDL…")
         for tid in tids:
             RebootManager.reboot_to_edl(tid)
@@ -468,6 +680,7 @@ class CountFactoryStation(QMainWindow):
 
     def _enter_done(self):
         self._set_phase(P_DONE)
+        self._set_progress(100, color=Colors.SUCCESS)
         self._set_detail(f"All {self._device_count} device(s) complete")
         elapsed = time.monotonic() - self._cycle_t0
         self._log(f"Run complete — {self._device_count} device(s) DONE in {_fmt_elapsed(elapsed)}")
@@ -519,6 +732,7 @@ class CountFactoryStation(QMainWindow):
         dlg.exec()
         self.log_box.clear()
         self._set_phase(P_IDLE)
+        self._set_progress(0)
         self._set_detail("Waiting for EDL devices…")
 
 
