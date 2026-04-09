@@ -34,7 +34,7 @@ from config import (
     FACTORY_FW_PATH_ENV, PROD_DEBUG_FW_PATH_ENV,
     BOOT_TIMEOUT_SEC_ENV, DEFAULT_BOOT_TIMEOUT_SEC,
     EXPECTED_BUILD_ID,
-    QDL_BIN, QDL_LIST_SOCKET, QDL_PROGRESS_SOCK_PREFIX,
+    QDL_BIN, QDL_PROGRESS_SOCK_PREFIX,
 )
 from styles import Styles, Colors
 from utils_device_manager import DeviceScanner
@@ -99,12 +99,20 @@ _PHASE_COLOR = {
 # ── Count-only helpers ───────────────────────────────────────────────────────
 
 def _edl_serials():
-    """Return list of QDL serials visible on the list-server right now."""
-    device_list = DeviceScanner._query_list_socket()
-    if not device_list:
+    """Return list of QDL serials by running `qdl list`."""
+    try:
+        out = subprocess.check_output(
+            ["sudo", QDL_BIN, "list"], stderr=subprocess.DEVNULL, timeout=5
+        ).decode()
+        serials = []
+        for line in out.splitlines()[1:]:  # skip header row
+            parts = line.split()
+            if len(parts) >= 2:
+                serials.append(parts[1])
+        return serials
+    except Exception as exc:
+        log.debug("qdl list: %s", exc)
         return []
-    return [d.get("serial", "").strip() for d in device_list
-            if d.get("serial", "").strip()]
 
 
 def _adb_transport_ids():
@@ -155,27 +163,11 @@ class CountFactoryStation(QMainWindow):
         self._timing_log         = FlashTimingLog()
 
         self._setup_ui()
-        self._start_list_server()
         self._idle_timer = QTimer()
         self._idle_timer.timeout.connect(self._idle_tick)
         self._idle_timer.start(SCAN_INTERVAL_MS)
 
-    # ── List-server ──────────────────────────────────────────────────────────
-
-    def _start_list_server(self):
-        try:
-            self._ls_proc = subprocess.Popen(
-                ["sudo", QDL_BIN, "list-server", "--socket", QDL_LIST_SOCKET],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            log.info("qdl list-server started (pid=%d)", self._ls_proc.pid)
-        except Exception as exc:
-            log.warning("Could not start qdl list-server: %s", exc)
-            self._ls_proc = None
-
     def closeEvent(self, event):
-        if getattr(self, "_ls_proc", None):
-            self._ls_proc.terminate()
         super().closeEvent(event)
 
     # ── UI setup ─────────────────────────────────────────────────────────────

@@ -69,16 +69,36 @@ QDL_INSTALL_PATH="/usr/local/bin/qdl"
 PREBUILT="$SCRIPT_DIR/qdl-prebuilt"
 QDL_SRC="$SCRIPT_DIR/qdl"
 
+_build_qdl_from_source() {
+    if [[ -d "$QDL_SRC" && -f "$QDL_SRC/Makefile" ]]; then
+        echo "      Building from source: $QDL_SRC"
+        make -C "$QDL_SRC" clean
+        make -C "$QDL_SRC" -j"$(nproc)"
+        install -m 755 "$QDL_SRC/qdl" "$QDL_INSTALL_PATH"
+        echo "      Built and installed to $QDL_INSTALL_PATH"
+    else
+        echo "ERROR: Pre-built binary is incompatible and no source tree found." >&2
+        echo "       Provide either:" >&2
+        echo "         • A compatible pre-built binary at: $PREBUILT" >&2
+        echo "         • The qdl source tree at: $QDL_SRC" >&2
+        exit 1
+    fi
+}
+
 if [[ -f "$PREBUILT" ]]; then
-    echo "      Using pre-built binary: $PREBUILT"
-    install -m 755 "$PREBUILT" "$QDL_INSTALL_PATH"
-    echo "      Installed to $QDL_INSTALL_PATH"
+    # Test the prebuilt before committing — it may be linked against a newer
+    # glibc than this machine has (e.g. built on Ubuntu 22+ but running on 20.04)
+    if "$PREBUILT" --help >/dev/null 2>&1 || "$PREBUILT" 2>&1 | grep -qv "version.*not found"; then
+        echo "      Using pre-built binary: $PREBUILT"
+        install -m 755 "$PREBUILT" "$QDL_INSTALL_PATH"
+        echo "      Installed to $QDL_INSTALL_PATH"
+    else
+        echo "      Pre-built binary is incompatible on this system (glibc mismatch)."
+        echo "      Falling back to building from source..."
+        _build_qdl_from_source
+    fi
 elif [[ -d "$QDL_SRC" && -f "$QDL_SRC/Makefile" ]]; then
-    echo "      Building from source: $QDL_SRC"
-    make -C "$QDL_SRC" clean
-    make -C "$QDL_SRC" -j"$(nproc)"
-    install -m 755 "$QDL_SRC/qdl" "$QDL_INSTALL_PATH"
-    echo "      Built and installed to $QDL_INSTALL_PATH"
+    _build_qdl_from_source
 else
     echo "ERROR: Neither $PREBUILT nor $QDL_SRC/Makefile found." >&2
     echo "       Provide either:" >&2
