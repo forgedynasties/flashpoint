@@ -161,6 +161,7 @@ def _edl_serials():
     """Return list of QDL serials by running `qdl list`.
 
     Output format: <vid>:<pid>\t<serial>  (one device per line, no header)
+    Lines not matching that format (e.g. "No devices found") are ignored.
     """
     try:
         out = subprocess.check_output(
@@ -169,7 +170,8 @@ def _edl_serials():
         serials = []
         for line in out.splitlines():
             parts = line.split()
-            if len(parts) >= 2:
+            # Valid device line: parts[0] is "XXXX:XXXX" (vid:pid)
+            if len(parts) >= 2 and ":" in parts[0]:
                 serials.append(parts[1])
         return serials
     except Exception as exc:
