@@ -463,7 +463,7 @@ class CountFactoryStation(QMainWindow):
         self._failed_count = 0
         self._processes    = []
         self._dev_progress = {
-            i: {"serial": serials[i], "bytes_done": 0, "op_cursor": 0}
+            i: {"serial": serials[i], "bytes_done": 0, "op_cursor": 0, "cur_pct": 0.0}
             for i in range(n)
         }
 
@@ -523,30 +523,41 @@ class CountFactoryStation(QMainWindow):
                 if m and dev_idx in self._dev_progress:
                     label = m.group(1)
                     dev   = self._dev_progress[dev_idx]
-                    # Advance cursor to next op matching this label and add its bytes
                     cursor = dev["op_cursor"]
                     while cursor < len(self._ops) and self._ops[cursor][0] != label:
                         cursor += 1
                     if cursor < len(self._ops):
                         dev["bytes_done"] += self._ops[cursor][1]
                         dev["op_cursor"]   = cursor + 1
+                    dev["cur_pct"] = 0.0  # reset; next op hasn't started yet
                     self._update_overall_progress()
             elif event == "error":
                 self._log(f"  [qdl ERR] {message}")
+            elif event == "progress" and dev_idx in self._dev_progress:
+                dev = self._dev_progress[dev_idx]
+                dev["cur_pct"] = min(float(msg.get("percent", 0.0)), 100.0)
+                self._update_overall_progress()
 
     def _update_overall_progress(self):
         if not self._total_bytes or not self._dev_progress:
             return
-        n        = len(self._dev_progress)
-        avg_done = sum(d["bytes_done"] for d in self._dev_progress.values()) / n
-        pct      = int(avg_done / self._total_bytes * 100)
+
+        def _live_bytes(dev):
+            done  = dev["bytes_done"]
+            cursor = dev["op_cursor"]
+            if cursor < len(self._ops):
+                done += self._ops[cursor][1] * dev["cur_pct"] / 100.0
+            return done
 
         def _fmt_mb(b):
             return f"{b / 1e6:.0f} MB" if b < 1e9 else f"{b / 1e9:.2f} GB"
 
+        n         = len(self._dev_progress)
+        avg_live  = sum(_live_bytes(d) for d in self._dev_progress.values()) / n
+        pct       = int(avg_live / self._total_bytes * 100)
         total_fmt = _fmt_mb(self._total_bytes)
-        parts = [
-            f"{d['serial']}: {_fmt_mb(d['bytes_done'])}/{total_fmt}"
+        parts     = [
+            f"{d['serial']}: {_fmt_mb(_live_bytes(d))}/{total_fmt}"
             for d in self._dev_progress.values()
         ]
         self._set_detail("  |  ".join(parts))
