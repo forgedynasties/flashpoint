@@ -219,7 +219,8 @@ class CountFactoryStation(QMainWindow):
         self._timeout_timer = None
         self._ops          = []   # [(label, bytes)] ordered ops for current stage
         self._total_bytes  = 0    # total bytes across all ops
-        # Per-device progress: idx → {serial, bytes_done, op_cursor}
+        self._stage_t0     = 0.0  # monotonic time when flash stage started
+        # Per-device progress: idx → {serial, bytes_done, op_cursor, cur_pct}
         self._dev_progress = {}
 
         self._setup_ui()
@@ -323,13 +324,21 @@ class CountFactoryStation(QMainWindow):
             f"color:{Colors.WHITE};font-size:16px;font-weight:700;"
         )
 
+        self.lbl_eta = QLabel("")
+        self.lbl_eta.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_eta.setStyleSheet(
+            f"color:{Colors.TEXT_SECONDARY};font-size:13px;"
+        )
+
         vbox.addSpacing(18)
         vbox.addWidget(self.lbl_phase)
         vbox.addSpacing(14)
         vbox.addWidget(pw)
         vbox.addSpacing(6)
         vbox.addWidget(self.lbl_detail)
-        vbox.addSpacing(18)
+        vbox.addSpacing(2)
+        vbox.addWidget(self.lbl_eta)
+        vbox.addSpacing(14)
         parent.addWidget(body)
 
     def _build_log(self, parent):
@@ -354,6 +363,9 @@ class CountFactoryStation(QMainWindow):
 
     def _set_detail(self, text):
         self.lbl_detail.setText(text)
+
+    def _set_eta(self, text):
+        self.lbl_eta.setText(text)
 
     def _set_progress(self, value, *, spin=False, color=None):
         if spin:
@@ -414,6 +426,7 @@ class CountFactoryStation(QMainWindow):
         self._processes.clear()
         self._set_phase(P_FAILED)
         self._set_progress(0, color=Colors.ERROR)
+        self._set_eta("")
         self._set_detail("Stopped by operator")
         self._reset_to_idle()
 
@@ -425,6 +438,7 @@ class CountFactoryStation(QMainWindow):
         self._processes.clear()
         self._set_phase(P_FAILED)
         self._set_progress(0, color=Colors.ERROR)
+        self._set_eta("")
         self._set_detail(reason)
         self._log(f"FAILED: {reason}")
         self._reset_to_idle()
@@ -450,6 +464,7 @@ class CountFactoryStation(QMainWindow):
 
         wdir = FlashManager.get_working_directory(raw)
         self._ops, self._total_bytes = _scan_flash_ops(raw, wdir)
+        self._stage_t0 = time.monotonic()
         log.info("Stage %d: %d ops, %.0f MB total",
                  stage, len(self._ops), self._total_bytes / 1e6)
 
@@ -543,7 +558,7 @@ class CountFactoryStation(QMainWindow):
             return
 
         def _live_bytes(dev):
-            done  = dev["bytes_done"]
+            done   = dev["bytes_done"]
             cursor = dev["op_cursor"]
             if cursor < len(self._ops):
                 done += self._ops[cursor][1] * dev["cur_pct"] / 100.0
@@ -552,15 +567,33 @@ class CountFactoryStation(QMainWindow):
         def _fmt_mb(b):
             return f"{b / 1e6:.0f} MB" if b < 1e9 else f"{b / 1e9:.2f} GB"
 
-        n         = len(self._dev_progress)
-        avg_live  = sum(_live_bytes(d) for d in self._dev_progress.values()) / n
-        pct       = int(avg_live / self._total_bytes * 100)
+        def _fmt_eta(sec):
+            sec = int(sec)
+            if sec < 60:
+                return f"ETA {sec}s"
+            m, s = divmod(sec, 60)
+            return f"ETA {m}m {s:02d}s"
+
+        n        = len(self._dev_progress)
+        avg_live = sum(_live_bytes(d) for d in self._dev_progress.values()) / n
+        pct      = int(avg_live / self._total_bytes * 100)
+
+        # Throughput-based ETA (wait at least 2 s before showing)
+        elapsed = time.monotonic() - self._stage_t0
+        if elapsed >= 2.0 and avg_live > 0:
+            rate        = avg_live / elapsed          # bytes/sec
+            remaining   = self._total_bytes - avg_live
+            eta_text    = _fmt_eta(remaining / rate) if remaining > 0 else ""
+        else:
+            eta_text = ""
+
         total_fmt = _fmt_mb(self._total_bytes)
         parts     = [
             f"{d['serial']}: {_fmt_mb(_live_bytes(d))}/{total_fmt}"
             for d in self._dev_progress.values()
         ]
         self._set_detail("  |  ".join(parts))
+        self._set_eta(eta_text)
         self._set_progress(min(pct, 99))
 
     def _on_flash_done(self, code, stage, serial, total, idx):
@@ -595,6 +628,7 @@ class CountFactoryStation(QMainWindow):
         )
         self._set_phase(P_BOOTING)
         self._set_progress(0, spin=True)
+        self._set_eta("")
         self._set_detail(f"0 / {self._device_count} in ADB")
 
         self._poll_timer = QTimer()
@@ -649,6 +683,7 @@ class CountFactoryStation(QMainWindow):
     def _enter_rebooting(self, tids):
         self._set_phase(P_TO_EDL)
         self._set_progress(0, spin=True)
+        self._set_eta("")
         self._set_detail(f"Rebooting {len(tids)} device(s) to EDL…")
         for tid in tids:
             RebootManager.reboot_to_edl(tid)
@@ -680,6 +715,7 @@ class CountFactoryStation(QMainWindow):
     def _enter_done(self):
         self._set_phase(P_DONE)
         self._set_progress(100, color=Colors.SUCCESS)
+        self._set_eta("")
         self._set_detail(f"All {self._device_count} device(s) complete")
         elapsed = time.monotonic() - self._cycle_t0
         self._log(f"Run complete — {self._device_count} device(s) DONE in {_fmt_elapsed(elapsed)}")
@@ -732,6 +768,7 @@ class CountFactoryStation(QMainWindow):
         self.log_box.clear()
         self._set_phase(P_IDLE)
         self._set_progress(0)
+        self._set_eta("")
         self._set_detail("Waiting for EDL devices…")
 
 
