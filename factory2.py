@@ -166,6 +166,13 @@ class CountFactoryStation(QMainWindow):
         self._timing_log         = FlashTimingLog()
 
         self._setup_ui()
+
+        log.info("=== Factory Flash Station startup ===")
+        log.info("  QDL_BIN            = %s", QDL_BIN)
+        log.info("  FACTORY_FW_PATH    = %s", self.factory_fw or "(not set)")
+        log.info("  PROD_DEBUG_FW_PATH = %s", self.prod_fw or "(not set)")
+        log.info("  BOOT_TIMEOUT_SEC   = %d", self.boot_timeout_ms // 1000)
+
         self._idle_timer = QTimer()
         self._idle_timer.timeout.connect(self._idle_tick)
         self._idle_timer.start(1000)
