@@ -217,8 +217,9 @@ class CountFactoryStation(QMainWindow):
         self._cycle_t0     = 0.0  # monotonic time when Start was pressed
         self._poll_timer   = None
         self._timeout_timer = None
-        self._total_ops    = 0    # total flash ops for current stage (from rawprogram scan)
-        # Per-device progress: idx → {serial, ops_done}
+        self._ops          = []   # [(label, bytes)] ordered ops for current stage
+        self._total_bytes  = 0    # total bytes across all ops
+        # Per-device progress: idx → {serial, bytes_done, op_cursor}
         self._dev_progress = {}
 
         self._setup_ui()
@@ -448,9 +449,9 @@ class CountFactoryStation(QMainWindow):
             return
 
         wdir = FlashManager.get_working_directory(raw)
-        ops, _ = _scan_flash_ops(raw, wdir)
-        self._total_ops = len(ops)
-        log.info("Stage %d: %d ops", stage, self._total_ops)
+        self._ops, self._total_bytes = _scan_flash_ops(raw, wdir)
+        log.info("Stage %d: %d ops, %.0f MB total",
+                 stage, len(self._ops), self._total_bytes / 1e6)
 
         n = len(serials)
         self._set_phase(phase)
@@ -462,7 +463,7 @@ class CountFactoryStation(QMainWindow):
         self._failed_count = 0
         self._processes    = []
         self._dev_progress = {
-            i: {"serial": serials[i], "ops_done": 0}
+            i: {"serial": serials[i], "bytes_done": 0, "op_cursor": 0}
             for i in range(n)
         }
 
@@ -501,7 +502,7 @@ class CountFactoryStation(QMainWindow):
         proc.start(args[0], args[1:])
         log.info("Stage %d: qdl started for serial=%s", stage, serial)
 
-    _FLASHED_RE = re.compile(r'^flashed ".+?" successfully')
+    _FLASHED_RE = re.compile(r'^flashed "(.+?)" successfully')
 
     def _on_progress(self, sock, dev_idx):
         data = bytes(sock.readAll()).decode(errors="replace")
@@ -518,20 +519,34 @@ class CountFactoryStation(QMainWindow):
 
             if event == "info":
                 self._log(f"  [qdl] {message}")
-                if self._FLASHED_RE.match(message) and dev_idx in self._dev_progress:
-                    self._dev_progress[dev_idx]["ops_done"] += 1
+                m = self._FLASHED_RE.match(message)
+                if m and dev_idx in self._dev_progress:
+                    label = m.group(1)
+                    dev   = self._dev_progress[dev_idx]
+                    # Advance cursor to next op matching this label and add its bytes
+                    cursor = dev["op_cursor"]
+                    while cursor < len(self._ops) and self._ops[cursor][0] != label:
+                        cursor += 1
+                    if cursor < len(self._ops):
+                        dev["bytes_done"] += self._ops[cursor][1]
+                        dev["op_cursor"]   = cursor + 1
                     self._update_overall_progress()
             elif event == "error":
                 self._log(f"  [qdl ERR] {message}")
 
     def _update_overall_progress(self):
-        if not self._total_ops or not self._dev_progress:
+        if not self._total_bytes or not self._dev_progress:
             return
-        n             = len(self._dev_progress)
-        done_ops_all  = sum(d["ops_done"] for d in self._dev_progress.values())
-        pct           = int(done_ops_all / (self._total_ops * n) * 100)
+        n        = len(self._dev_progress)
+        avg_done = sum(d["bytes_done"] for d in self._dev_progress.values()) / n
+        pct      = int(avg_done / self._total_bytes * 100)
+
+        def _fmt_mb(b):
+            return f"{b / 1e6:.0f} MB" if b < 1e9 else f"{b / 1e9:.2f} GB"
+
+        total_fmt = _fmt_mb(self._total_bytes)
         parts = [
-            f"{d['serial']}: {d['ops_done']}/{self._total_ops}"
+            f"{d['serial']}: {_fmt_mb(d['bytes_done'])}/{total_fmt}"
             for d in self._dev_progress.values()
         ]
         self._set_detail("  |  ".join(parts))
@@ -539,7 +554,7 @@ class CountFactoryStation(QMainWindow):
 
     def _on_flash_done(self, code, stage, serial, total, idx):
         if idx in self._dev_progress:
-            self._dev_progress[idx]["ops_done"] = self._total_ops
+            self._dev_progress[idx]["bytes_done"] = self._total_bytes
         self._update_overall_progress()
 
         self._done_count += 1
