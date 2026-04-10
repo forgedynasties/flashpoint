@@ -672,18 +672,15 @@ class CountFactoryStation(QMainWindow):
             self._enter_done()
 
     def _stage1_device_failed(self, serial):
-        """Handle device failure during stage 1 — stop everything and ask for manual reboot."""
+        """Handle device failure during stage 1 — stop everything."""
         self._log(f"Stage 1 failed on {serial} — stopping all devices")
         self._stop_phase_timers()
         for p in self._processes:
             if p.state() != QProcess.ProcessState.NotRunning:
                 p.kill()
         self._processes.clear()
-        self._set_phase(P_FAILED)
-        self._set_progress(0, color=Colors.ERROR)
-        self._set_eta("")
-        self._set_detail(f"Stage 1 failed on {serial}")
-        self._show_manual_reboot_dialog_after_failure()
+        self._set_failed(f"Stage 1 failed on {serial}")
+        self._reset_to_idle()
 
 
     # ── Manual reboot to EDL ─────────────────────────────────────────────────
@@ -697,9 +694,9 @@ class CountFactoryStation(QMainWindow):
         self._show_manual_reboot_dialog()
 
     def _show_manual_reboot_dialog(self):
-        """Show dialog asking user to reboot devices normally."""
+        """Show dialog asking user to reboot devices to ADB, with live ADB count."""
         dlg = QDialog(self)
-        dlg.setWindowTitle("Device Reboot Required")
+        dlg.setWindowTitle("Reboot to ADB")
         dlg.setModal(True)
         dlg.setMinimumWidth(380)
         dlg.setStyleSheet(
@@ -715,29 +712,47 @@ class CountFactoryStation(QMainWindow):
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon.setStyleSheet(f"color:{Colors.USER_MODE};font-size:48px;font-weight:700;")
 
-        title = QLabel("Reboot Devices")
+        title = QLabel("Reboot to ADB")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setWordWrap(True)
         title.setStyleSheet(f"color:{Colors.WHITE};font-size:15px;font-weight:700;")
 
-        msg = QLabel(f"Please reboot {self._device_count} device(s)")
+        msg = QLabel(f"Please reboot all {self._device_count} device(s) to ADB")
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
         msg.setWordWrap(True)
         msg.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:13px;")
 
-        hint = QLabel("Devices will be automatically rebooted to EDL when they return")
+        hint = QLabel("Run: adb reboot (on each device or use mass reboot)")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:11px;")
 
-        btn = QPushButton("Devices Rebooting")
+        # Live ADB count label
+        adb_count_label = QLabel()
+        adb_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        adb_count_label.setStyleSheet(f"color:{Colors.USER_MODE};font-size:12px;font-weight:700;")
+
+        def update_adb_count():
+            tids = _adb_transport_ids()
+            adb_count_label.setText(f"ADB devices: {len(tids)}/{self._device_count}")
+
+        # Initial update
+        update_adb_count()
+
+        # Timer to update ADB count live
+        count_timer = QTimer()
+        count_timer.timeout.connect(update_adb_count)
+        count_timer.start(1500)
+
+        btn = QPushButton("Devices Rebooting to ADB")
         btn.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
         btn.setFixedHeight(38)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
         def on_continue():
+            count_timer.stop()
             dlg.accept()
-            self._log("User confirmed devices are rebooting — waiting for ADB")
+            self._log("User confirmed devices are rebooting to ADB — waiting for ADB")
             self._enter_manual_reboot_wait()
 
         btn.clicked.connect(on_continue)
@@ -746,8 +761,16 @@ class CountFactoryStation(QMainWindow):
         layout.addWidget(title)
         layout.addWidget(msg)
         layout.addWidget(hint)
+        layout.addSpacing(8)
+        layout.addWidget(adb_count_label)
         layout.addSpacing(16)
         layout.addWidget(btn)
+
+        def cleanup():
+            count_timer.stop()
+
+        dlg.rejected.connect(cleanup)
+        dlg.accepted.connect(cleanup)
 
         dlg.exec()
 
@@ -779,105 +802,6 @@ class CountFactoryStation(QMainWindow):
         self._log(f"All {self._device_count} device(s) returned to ADB — rebooting to EDL")
         self._stop_phase_timers()
         self._enter_rebooting(tids[: self._device_count])
-
-    def _show_manual_reboot_dialog_after_failure(self):
-        """Show dialog after stage 1 failure, asking user to reboot all devices normally."""
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Stage 1 Failed")
-        dlg.setModal(True)
-        dlg.setMinimumWidth(400)
-        dlg.setStyleSheet(
-            f"background:{Colors.BG_SURFACE};"
-            f"color:{Colors.TEXT_PRIMARY};"
-        )
-
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(32, 28, 32, 24)
-        layout.setSpacing(16)
-
-        icon = QLabel("⚠")
-        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setStyleSheet(f"color:{Colors.ERROR};font-size:48px;font-weight:700;")
-
-        title = QLabel("Stage 1 Failed — Reboot Required")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setWordWrap(True)
-        title.setStyleSheet(f"color:{Colors.WHITE};font-size:15px;font-weight:700;")
-
-        msg = QLabel(f"One or more devices failed during stage 1.\nPlease reboot all {self._device_count} device(s)")
-        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        msg.setWordWrap(True)
-        msg.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:13px;")
-
-        hint = QLabel("Devices will be automatically rebooted to EDL for retry")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:11px;")
-
-        btn = QPushButton("Devices Rebooting")
-        btn.setStyleSheet(Styles.get_action_button_style(Colors.WARNING))
-        btn.setFixedHeight(38)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        def on_retry():
-            dlg.accept()
-            self._log("User confirmed devices are rebooting — waiting for ADB to retry stage 1")
-            self._enter_manual_reboot_wait_for_retry()
-
-        btn.clicked.connect(on_retry)
-
-        layout.addWidget(icon)
-        layout.addWidget(title)
-        layout.addWidget(msg)
-        layout.addWidget(hint)
-        layout.addSpacing(16)
-        layout.addWidget(btn)
-
-        dlg.exec()
-
-    def _enter_manual_reboot_wait_for_retry(self):
-        """Wait for devices to appear in ADB after manual reboot, then auto-reboot to EDL for retry."""
-        self._set_phase(P_QDL_DRAIN)
-        self._set_progress(0, spin=True)
-        self._set_eta("")
-        self._set_detail(f"0 / {self._device_count} in ADB (retrying stage 1)")
-
-        self._poll_timer = QTimer()
-        self._poll_timer.timeout.connect(self._check_adb_for_retry)
-        self._poll_timer.start(SCAN_INTERVAL_MS)
-
-        self._timeout_timer = QTimer()
-        self._timeout_timer.setSingleShot(True)
-        self._timeout_timer.timeout.connect(self._boot_timeout)
-        self._timeout_timer.start(self.boot_timeout_ms)
-
-    def _check_adb_for_retry(self):
-        """Poll for ADB devices after manual reboot, then auto-reboot to EDL for retry."""
-        tids = _adb_transport_ids()
-        self._set_detail(f"{len(tids)} / {self._device_count} in ADB (retrying stage 1)")
-        if len(tids) < self._device_count:
-            return
-
-        # Enough devices in ADB — stop poll timer and reboot to EDL for retry
-        self._poll_timer.stop()
-        self._log(f"All {self._device_count} device(s) returned to ADB — rebooting to EDL to retry stage 1")
-        self._stop_phase_timers()
-        self._reset_to_idle()
-        
-        # Reboot to EDL, then start stage 1 again
-        def retry_stage1():
-            serials = _edl_serials()
-            if serials:
-                self._log(f"Retrying stage 1 with {len(serials)} device(s) in EDL")
-                self._flash_stage(serials[: self._device_count], stage=1)
-            else:
-                self._set_failed("No devices found in EDL for retry")
-        
-        for tid in tids[: self._device_count]:
-            RebootManager.reboot_to_edl(tid)
-        # 3 s delay for devices to disconnect before checking EDL
-        QTimer.singleShot(3000, retry_stage1)
-
 
     # ── Boot detection ────────────────────────────────────────────────────────
 
