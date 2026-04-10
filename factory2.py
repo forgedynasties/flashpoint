@@ -646,6 +646,12 @@ class CountFactoryStation(QMainWindow):
                 self._dev_progress[idx]["failed"] = True
         self._update_overall_progress()
 
+        # Stage 1: if ANY device fails, stop immediately and ask for manual reboot
+        if stage == 1 and code != 0:
+            self._log(f"  ✗ stage {stage} FAILED  serial={serial}")
+            self._stage1_device_failed(serial)
+            return
+
         self._done_count += 1
         if code != 0:
             self._failed_count += 1
@@ -664,6 +670,21 @@ class CountFactoryStation(QMainWindow):
             self._enter_qdl_drain()
         else:
             self._enter_done()
+
+    def _stage1_device_failed(self, serial):
+        """Handle device failure during stage 1 — stop everything and ask for manual reboot."""
+        self._log(f"Stage 1 failed on {serial} — stopping all devices")
+        self._stop_phase_timers()
+        for p in self._processes:
+            if p.state() != QProcess.ProcessState.NotRunning:
+                p.kill()
+        self._processes.clear()
+        self._set_phase(P_FAILED)
+        self._set_progress(0, color=Colors.ERROR)
+        self._set_eta("")
+        self._set_detail(f"Stage 1 failed on {serial}")
+        self._show_manual_reboot_dialog_after_failure()
+
 
     # ── Manual reboot to EDL ─────────────────────────────────────────────────
 
@@ -734,6 +755,68 @@ class CountFactoryStation(QMainWindow):
         layout.addWidget(btn)
 
         dlg.exec()
+
+    def _show_manual_reboot_dialog_after_failure(self):
+        """Show dialog after stage 1 failure, asking user to reboot all devices to EDL."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Stage 1 Failed")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(400)
+        dlg.setStyleSheet(
+            f"background:{Colors.BG_SURFACE};"
+            f"color:{Colors.TEXT_PRIMARY};"
+        )
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(32, 28, 32, 24)
+        layout.setSpacing(16)
+
+        icon = QLabel("⚠")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet(f"color:{Colors.ERROR};font-size:48px;font-weight:700;")
+
+        title = QLabel("Stage 1 Failed — Reboot Required")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setWordWrap(True)
+        title.setStyleSheet(f"color:{Colors.WHITE};font-size:15px;font-weight:700;")
+
+        msg = QLabel(f"One or more devices failed during stage 1.\nPlease manually reboot all {self._device_count} device(s) to EDL mode")
+        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        msg.setWordWrap(True)
+        msg.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:13px;")
+
+        hint = QLabel("Use physical reboot button or adb reboot edl on each device")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:11px;")
+
+        btn = QPushButton("Reboot Complete — Retry Stage 1")
+        btn.setStyleSheet(Styles.get_action_button_style(Colors.WARNING))
+        btn.setFixedHeight(38)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def on_retry():
+            self._log("User clicked Retry — checking for EDL devices")
+            serials = _edl_serials()
+            if serials:
+                self._log(f"Found {len(serials)} device(s) in EDL — retrying stage 1")
+                self._reset_to_idle()
+                self._flash_stage(serials[: self._device_count], stage=1)
+            else:
+                self._set_failed("No devices found in EDL for retry")
+            dlg.accept()
+
+        btn.clicked.connect(on_retry)
+
+        layout.addWidget(icon)
+        layout.addWidget(title)
+        layout.addWidget(msg)
+        layout.addWidget(hint)
+        layout.addSpacing(16)
+        layout.addWidget(btn)
+
+        dlg.exec()
+
 
     # ── Boot detection ────────────────────────────────────────────────────────
 
