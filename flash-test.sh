@@ -10,6 +10,11 @@ EDL_TIMEOUT=60
 FAC_FW="${FACTORY_FW_PATH:?Set FACTORY_FW_PATH}"
 DBG_FW="${PROD_DEBUG_FW_PATH:?Set PROD_DEBUG_FW_PATH}"
 
+echo "QDL_BIN:          $QDL"
+echo "FACTORY_FW_PATH:  $FAC_FW"
+echo "PROD_DEBUG_FW_PATH: $DBG_FW"
+echo ""
+
 find_fw() {
     local dir="$1"
     PROG=$(find "$dir" -maxdepth 1 -name '*prog*.elf' | head -1)
