@@ -40,6 +40,7 @@ from utils_flash_manager import FlashManager, RebootManager
 log = logging.getLogger(__name__)
 
 EDL_RETURN_TIMEOUT_MS = 60_000   # 60 s for devices to return to EDL after reboot
+QDL_DRAIN_TIMEOUT_MS  = 15_000  # 15 s for devices to leave QDL after stage 1
 
 
 def _fmt_elapsed(sec: float) -> str:
@@ -136,22 +137,24 @@ def _scan_flash_ops(raw_xml_path, fw_dir):
 
 
 # ── Phase constants ──────────────────────────────────────────────────────────
-P_IDLE    = "IDLE"
-P_FLASH1  = "FLASH 1/3"
-P_BOOTING = "BOOTING"
-P_TO_EDL  = "TO EDL"
-P_FLASH3  = "FLASH 3/3"
-P_DONE    = "DONE"
-P_FAILED  = "FAILED"
+P_IDLE      = "IDLE"
+P_FLASH1    = "FLASH 1/3"
+P_QDL_DRAIN = "QDL DRAIN"
+P_BOOTING   = "BOOTING"
+P_TO_EDL    = "TO EDL"
+P_FLASH3    = "FLASH 3/3"
+P_DONE      = "DONE"
+P_FAILED    = "FAILED"
 
 _PHASE_COLOR = {
-    P_IDLE:    Colors.TEXT_SECONDARY,
-    P_FLASH1:  Colors.WARNING,
-    P_BOOTING: Colors.USER_MODE,
-    P_TO_EDL:  Colors.EDL_MODE,
-    P_FLASH3:  Colors.WARNING,
-    P_DONE:    Colors.SUCCESS,
-    P_FAILED:  Colors.ERROR,
+    P_IDLE:      Colors.TEXT_SECONDARY,
+    P_FLASH1:    Colors.WARNING,
+    P_QDL_DRAIN: Colors.USER_MODE,
+    P_BOOTING:   Colors.USER_MODE,
+    P_TO_EDL:    Colors.EDL_MODE,
+    P_FLASH3:    Colors.WARNING,
+    P_DONE:      Colors.SUCCESS,
+    P_FAILED:    Colors.ERROR,
 }
 
 
@@ -176,6 +179,37 @@ def _edl_serials():
         return serials
     except Exception as exc:
         log.debug("qdl list: %s", exc)
+        return []
+
+
+def _lsusb_qdl_count():
+    """Count Qualcomm QDL devices via lsusb (no handle issues)."""
+    try:
+        out = subprocess.check_output(
+            ["lsusb", "-d", "05c6:"], stderr=subprocess.DEVNULL, timeout=5
+        ).decode()
+        return len([l for l in out.splitlines() if l.strip()])
+    except Exception:
+        return 0
+
+
+def _lsusb_edl_serials():
+    """Get EDL serial numbers via lsusb iProduct parsing."""
+    try:
+        out = subprocess.check_output(
+            "lsusb -v -d 05c6: 2>/dev/null | grep iProduct",
+            shell=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5
+        ).decode()
+        serials = []
+        for line in out.splitlines():
+            # Parse "SN:XXXX" from iProduct strings
+            match = re.search(r'SN:(\S+)', line)
+            if match:
+                serials.append(match.group(1))
+        return serials
+    except Exception:
         return []
 
 
@@ -627,9 +661,40 @@ class CountFactoryStation(QMainWindow):
                 f"Stage {stage}: {self._failed_count}/{total} device(s) failed"
             )
         elif stage == 1:
-            self._enter_booting()
+            self._enter_qdl_drain()
         else:
             self._enter_done()
+
+    # ── QDL drain ────────────────────────────────────────────────────────────
+
+    def _enter_qdl_drain(self):
+        self._log(f"Stage 1 complete — waiting {QDL_DRAIN_TIMEOUT_MS // 1000}s for QDL devices to clear")
+        self._set_phase(P_QDL_DRAIN)
+        self._set_progress(0, spin=True)
+        self._set_eta("")
+        count = _lsusb_qdl_count()
+        self._set_detail(f"Waiting for QDL to clear: {count} device(s) remaining")
+
+        self._poll_timer = QTimer()
+        self._poll_timer.timeout.connect(self._check_qdl_drain)
+        self._poll_timer.start(1500)  # 1.5s poll interval
+
+        self._timeout_timer = QTimer()
+        self._timeout_timer.setSingleShot(True)
+        self._timeout_timer.timeout.connect(self._qdl_drain_timeout)
+        self._timeout_timer.start(QDL_DRAIN_TIMEOUT_MS)
+
+    def _check_qdl_drain(self):
+        count = _lsusb_qdl_count()
+        self._set_detail(f"Waiting for QDL to clear: {count} device(s) remaining")
+        if count == 0:
+            self._stop_phase_timers()
+            self._log("QDL devices cleared — proceeding to ADB boot wait")
+            self._enter_booting()
+
+    def _qdl_drain_timeout(self):
+        self._poll_timer.stop()
+        self._show_stuck_dialog()
 
     # ── Boot detection ────────────────────────────────────────────────────────
 
@@ -781,6 +846,112 @@ class CountFactoryStation(QMainWindow):
         self._set_progress(0)
         self._set_eta("")
         self._set_detail("Waiting for EDL devices…")
+
+    def _show_stuck_dialog(self):
+        """Show dialog when devices are stuck in QDL after stage 1."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Devices stuck in QDL")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(400)
+        dlg.setStyleSheet(
+            f"background:{Colors.BG_SURFACE};"
+            f"color:{Colors.TEXT_PRIMARY};"
+        )
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(32, 28, 32, 24)
+        layout.setSpacing(16)
+
+        icon = QLabel("⚠")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet(f"color:{Colors.ERROR};font-size:48px;font-weight:700;")
+
+        title = QLabel("Devices stuck in QDL")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setWordWrap(True)
+        title.setStyleSheet(f"color:{Colors.WHITE};font-size:15px;font-weight:700;")
+
+        msg = QLabel("Manually reboot stuck devices into EDL")
+        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        msg.setWordWrap(True)
+        msg.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:13px;")
+
+        # Live EDL count label
+        edl_count_label = QLabel()
+        edl_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        edl_count_label.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:12px;")
+
+        def update_edl_count():
+            serials = _edl_serials()
+            edl_count_label.setText(f"EDL devices ready: {len(serials)}/{self._device_count}")
+
+        # Initial update
+        update_edl_count()
+
+        # Timer to update EDL count live
+        count_timer = QTimer()
+        count_timer.timeout.connect(update_edl_count)
+        count_timer.start(1500)
+
+        # Button: "Start Stage 3" (enabled when count >= device_count)
+        start_btn = QPushButton("Start Stage 3")
+        start_btn.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
+        start_btn.setFixedHeight(38)
+        start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def on_start_stage3():
+            count_timer.stop()
+            serials = _edl_serials()
+            if serials:
+                self._log(f"Starting stage 3 with {len(serials)} device(s) from stuck dialog")
+                self._flash_stage(serials[: self._device_count], stage=3)
+            dlg.accept()
+
+        start_btn.clicked.connect(on_start_stage3)
+
+        # Button: "Start Anyway" (always enabled)
+        anyway_btn = QPushButton("Start Anyway")
+        anyway_btn.setStyleSheet(Styles.get_action_button_style(Colors.WARNING))
+        anyway_btn.setFixedHeight(38)
+        anyway_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def on_start_anyway():
+            count_timer.stop()
+            serials = _edl_serials()
+            if serials:
+                self._log(f"Starting stage 3 anyway with {len(serials)} available device(s)")
+                self._flash_stage(serials[: self._device_count], stage=3)
+            dlg.accept()
+
+        anyway_btn.clicked.connect(on_start_anyway)
+
+        # Update start button enabled state based on EDL count
+        def check_enable_start():
+            serials = _edl_serials()
+            start_btn.setEnabled(len(serials) >= self._device_count)
+
+        check_enable_start()
+        check_timer = QTimer()
+        check_timer.timeout.connect(check_enable_start)
+        check_timer.start(1500)
+
+        layout.addWidget(icon)
+        layout.addWidget(title)
+        layout.addWidget(msg)
+        layout.addSpacing(8)
+        layout.addWidget(edl_count_label)
+        layout.addSpacing(16)
+        layout.addWidget(start_btn)
+        layout.addWidget(anyway_btn)
+
+        def cleanup():
+            count_timer.stop()
+            check_timer.stop()
+
+        dlg.rejected.connect(cleanup)
+        dlg.accepted.connect(cleanup)
+
+        dlg.exec()
 
 
 def main():
