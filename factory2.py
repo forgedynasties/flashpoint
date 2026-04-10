@@ -588,10 +588,12 @@ class CountFactoryStation(QMainWindow):
             eta_text = ""
 
         total_fmt = _fmt_mb(self._total_bytes)
-        parts     = [
-            f"{d['serial']}: {_fmt_mb(_live_bytes(d))}/{total_fmt}"
-            for d in self._dev_progress.values()
-        ]
+        parts = []
+        for d in self._dev_progress.values():
+            if d.get("failed"):
+                parts.append(f"{d['serial']}: FAILED")
+            else:
+                parts.append(f"{d['serial']}: {_fmt_mb(_live_bytes(d))}/{total_fmt}")
         self._set_detail("  |  ".join(parts))
         self._set_eta(eta_text)
         self._set_progress(min(pct, 99))
@@ -599,6 +601,8 @@ class CountFactoryStation(QMainWindow):
     def _on_flash_done(self, code, stage, serial, total, idx):
         if idx in self._dev_progress:
             self._dev_progress[idx]["bytes_done"] = self._total_bytes
+            if code != 0:
+                self._dev_progress[idx]["failed"] = True
         self._update_overall_progress()
 
         self._done_count += 1
@@ -774,6 +778,15 @@ class CountFactoryStation(QMainWindow):
 
 def main():
     import sys
+    if "--env" in sys.argv:
+        boot_timeout = os.getenv(BOOT_TIMEOUT_SEC_ENV, str(DEFAULT_BOOT_TIMEOUT_SEC))
+        print(f"QDL_BIN              = {QDL_BIN}")
+        print(f"FACTORY_FW_PATH      = {os.getenv(FACTORY_FW_PATH_ENV) or '(not set)'}")
+        print(f"PROD_DEBUG_FW_PATH   = {os.getenv(PROD_DEBUG_FW_PATH_ENV) or '(not set)'}")
+        print(f"BOOT_TIMEOUT_SEC     = {boot_timeout}")
+        print(f"EXPECTED_BUILD_ID    = {EXPECTED_BUILD_ID}")
+        return
+
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     sh  = logging.StreamHandler()
     sh.setFormatter(fmt)
