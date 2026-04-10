@@ -694,7 +694,7 @@ class CountFactoryStation(QMainWindow):
         self._show_manual_reboot_dialog()
 
     def _show_manual_reboot_dialog(self):
-        """Show dialog asking user to reboot devices to ADB, with live ADB count. Auto-proceeds when all detected."""
+        """Show dialog asking user to reboot devices to ADB, with live ADB count. Continue button enables when all detected."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Reboot to ADB")
         dlg.setModal(True)
@@ -732,16 +732,30 @@ class CountFactoryStation(QMainWindow):
         adb_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         adb_count_label.setStyleSheet(f"color:{Colors.USER_MODE};font-size:12px;font-weight:700;")
 
+        # Continue button (disabled until all devices appear)
+        btn = QPushButton("Continue to Stage 3")
+        btn.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
+        btn.setFixedHeight(38)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setEnabled(False)
+
         def update_adb_count():
             tids = _adb_transport_ids()
             adb_count_label.setText(f"ADB devices: {len(tids)}/{self._device_count}")
             
-            # Auto-proceed when all devices in ADB
+            # Enable button when all devices in ADB
             if len(tids) >= self._device_count:
-                count_timer.stop()
-                self._log(f"All {self._device_count} device(s) detected in ADB — rebooting to EDL")
-                dlg.accept()
-                self._enter_manual_reboot_wait()
+                btn.setEnabled(True)
+            else:
+                btn.setEnabled(False)
+
+        def on_continue():
+            count_timer.stop()
+            dlg.accept()
+            self._log("User confirmed all devices in ADB — rebooting to EDL and starting stage 3")
+            self._enter_manual_reboot_wait()
+
+        btn.clicked.connect(on_continue)
 
         # Initial update
         update_adb_count()
@@ -750,12 +764,6 @@ class CountFactoryStation(QMainWindow):
         count_timer = QTimer()
         count_timer.timeout.connect(update_adb_count)
         count_timer.start(1500)
-
-        btn = QPushButton("Devices Rebooting to ADB")
-        btn.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
-        btn.setFixedHeight(38)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setEnabled(False)  # Disabled since auto-proceed handles it
 
         layout.addWidget(icon)
         layout.addWidget(title)
