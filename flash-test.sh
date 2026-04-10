@@ -131,12 +131,17 @@ reboot_to_edl() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-mapfile -t SERIALS < <(get_serials)
+echo "Scanning for EDL devices..."
+while true; do
+    mapfile -t SERIALS < <(get_serials)
+    echo -ne "\r  ${#SERIALS[@]} EDL device(s) found: ${SERIALS[*]:-none}  "
+    read -t 2 -n 1 key 2>/dev/null && break || true
+done
+echo ""
 if [[ ${#SERIALS[@]} -eq 0 ]]; then
-    echo "No EDL devices found."
+    echo "No devices — aborting."
     exit 1
 fi
-echo "Found ${#SERIALS[@]} device(s): ${SERIALS[*]}"
 
 # Stage 1: factory firmware
 flash_all "$FAC_FW" 1
