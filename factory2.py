@@ -665,36 +665,75 @@ class CountFactoryStation(QMainWindow):
         else:
             self._enter_done()
 
-    # ── QDL drain ────────────────────────────────────────────────────────────
+    # ── Manual reboot to EDL ─────────────────────────────────────────────────
 
     def _enter_qdl_drain(self):
-        self._log(f"Stage 1 complete — waiting {QDL_DRAIN_TIMEOUT_MS // 1000}s for QDL devices to clear")
+        self._log("Stage 1 complete — waiting for manual reboot to EDL")
         self._set_phase(P_QDL_DRAIN)
         self._set_progress(0, spin=True)
         self._set_eta("")
-        count = _lsusb_qdl_count()
-        self._set_detail(f"Waiting for QDL to clear: {count} device(s) remaining")
+        self._set_detail("Waiting for manual reboot to EDL…")
+        self._show_manual_reboot_dialog()
 
-        self._poll_timer = QTimer()
-        self._poll_timer.timeout.connect(self._check_qdl_drain)
-        self._poll_timer.start(1500)  # 1.5s poll interval
+    def _show_manual_reboot_dialog(self):
+        """Show dialog prompting user to manually reboot devices to EDL."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Manual Reboot Required")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(380)
+        dlg.setStyleSheet(
+            f"background:{Colors.BG_SURFACE};"
+            f"color:{Colors.TEXT_PRIMARY};"
+        )
 
-        self._timeout_timer = QTimer()
-        self._timeout_timer.setSingleShot(True)
-        self._timeout_timer.timeout.connect(self._qdl_drain_timeout)
-        self._timeout_timer.start(QDL_DRAIN_TIMEOUT_MS)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(32, 28, 32, 24)
+        layout.setSpacing(16)
 
-    def _check_qdl_drain(self):
-        count = _lsusb_qdl_count()
-        self._set_detail(f"Waiting for QDL to clear: {count} device(s) remaining")
-        if count == 0:
-            self._stop_phase_timers()
-            self._log("QDL devices cleared — proceeding to ADB boot wait")
-            self._enter_booting()
+        icon = QLabel("↻")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet(f"color:{Colors.USER_MODE};font-size:48px;font-weight:700;")
 
-    def _qdl_drain_timeout(self):
-        self._poll_timer.stop()
-        self._show_stuck_dialog()
+        title = QLabel("Manually Reboot Devices")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setWordWrap(True)
+        title.setStyleSheet(f"color:{Colors.WHITE};font-size:15px;font-weight:700;")
+
+        msg = QLabel(f"Please manually reboot {self._device_count} device(s) to EDL mode")
+        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        msg.setWordWrap(True)
+        msg.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:13px;")
+
+        hint = QLabel("Use physical reboot button or adb reboot edl on each device")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:11px;")
+
+        btn = QPushButton("Continue to Stage 3")
+        btn.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
+        btn.setFixedHeight(38)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def on_continue():
+            self._log("User clicked Continue — checking for EDL devices")
+            serials = _edl_serials()
+            if serials:
+                self._log(f"Found {len(serials)} device(s) in EDL — starting stage 3")
+                self._flash_stage(serials[: self._device_count], stage=3)
+            else:
+                self._set_failed("No devices found in EDL after reboot")
+            dlg.accept()
+
+        btn.clicked.connect(on_continue)
+
+        layout.addWidget(icon)
+        layout.addWidget(title)
+        layout.addWidget(msg)
+        layout.addWidget(hint)
+        layout.addSpacing(16)
+        layout.addWidget(btn)
+
+        dlg.exec()
 
     # ── Boot detection ────────────────────────────────────────────────────────
 
@@ -846,112 +885,6 @@ class CountFactoryStation(QMainWindow):
         self._set_progress(0)
         self._set_eta("")
         self._set_detail("Waiting for EDL devices…")
-
-    def _show_stuck_dialog(self):
-        """Show dialog when devices are stuck in QDL after stage 1."""
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Devices stuck in QDL")
-        dlg.setModal(True)
-        dlg.setMinimumWidth(400)
-        dlg.setStyleSheet(
-            f"background:{Colors.BG_SURFACE};"
-            f"color:{Colors.TEXT_PRIMARY};"
-        )
-
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(32, 28, 32, 24)
-        layout.setSpacing(16)
-
-        icon = QLabel("⚠")
-        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setStyleSheet(f"color:{Colors.ERROR};font-size:48px;font-weight:700;")
-
-        title = QLabel("Devices stuck in QDL")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setWordWrap(True)
-        title.setStyleSheet(f"color:{Colors.WHITE};font-size:15px;font-weight:700;")
-
-        msg = QLabel("Manually reboot stuck devices into EDL")
-        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        msg.setWordWrap(True)
-        msg.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:13px;")
-
-        # Live EDL count label
-        edl_count_label = QLabel()
-        edl_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        edl_count_label.setStyleSheet(f"color:{Colors.TEXT_SECONDARY};font-size:12px;")
-
-        def update_edl_count():
-            serials = _edl_serials()
-            edl_count_label.setText(f"EDL devices ready: {len(serials)}/{self._device_count}")
-
-        # Initial update
-        update_edl_count()
-
-        # Timer to update EDL count live
-        count_timer = QTimer()
-        count_timer.timeout.connect(update_edl_count)
-        count_timer.start(1500)
-
-        # Button: "Start Stage 3" (enabled when count >= device_count)
-        start_btn = QPushButton("Start Stage 3")
-        start_btn.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
-        start_btn.setFixedHeight(38)
-        start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        def on_start_stage3():
-            count_timer.stop()
-            serials = _edl_serials()
-            if serials:
-                self._log(f"Starting stage 3 with {len(serials)} device(s) from stuck dialog")
-                self._flash_stage(serials[: self._device_count], stage=3)
-            dlg.accept()
-
-        start_btn.clicked.connect(on_start_stage3)
-
-        # Button: "Start Anyway" (always enabled)
-        anyway_btn = QPushButton("Start Anyway")
-        anyway_btn.setStyleSheet(Styles.get_action_button_style(Colors.WARNING))
-        anyway_btn.setFixedHeight(38)
-        anyway_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        def on_start_anyway():
-            count_timer.stop()
-            serials = _edl_serials()
-            if serials:
-                self._log(f"Starting stage 3 anyway with {len(serials)} available device(s)")
-                self._flash_stage(serials[: self._device_count], stage=3)
-            dlg.accept()
-
-        anyway_btn.clicked.connect(on_start_anyway)
-
-        # Update start button enabled state based on EDL count
-        def check_enable_start():
-            serials = _edl_serials()
-            start_btn.setEnabled(len(serials) >= self._device_count)
-
-        check_enable_start()
-        check_timer = QTimer()
-        check_timer.timeout.connect(check_enable_start)
-        check_timer.start(1500)
-
-        layout.addWidget(icon)
-        layout.addWidget(title)
-        layout.addWidget(msg)
-        layout.addSpacing(8)
-        layout.addWidget(edl_count_label)
-        layout.addSpacing(16)
-        layout.addWidget(start_btn)
-        layout.addWidget(anyway_btn)
-
-        def cleanup():
-            count_timer.stop()
-            check_timer.stop()
-
-        dlg.rejected.connect(cleanup)
-        dlg.accepted.connect(cleanup)
-
-        dlg.exec()
 
 
 def main():
