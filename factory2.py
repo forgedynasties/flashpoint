@@ -40,7 +40,7 @@ from utils_flash_manager import FlashManager, RebootManager
 log = logging.getLogger(__name__)
 
 EDL_RETURN_TIMEOUT_MS = 60_000   # 60 s for devices to return to EDL after reboot
-QDL_DRAIN_TIMEOUT_MS  = 15_000  # 15 s for devices to leave QDL after stage 1
+MANUAL_EDL_TIMEOUT_MS = 15_000  # 15 s for devices to reboot to EDL after stage 1
 
 
 def _fmt_elapsed(sec: float) -> str:
@@ -139,7 +139,7 @@ def _scan_flash_ops(raw_xml_path, fw_dir):
 # ── Phase constants ──────────────────────────────────────────────────────────
 P_IDLE      = "IDLE"
 P_FLASH1    = "FLASH 1/3"
-P_QDL_DRAIN = "QDL DRAIN"
+P_QDL_DRAIN = "MANUAL EDL"
 P_BOOTING   = "BOOTING"
 P_TO_EDL    = "TO EDL"
 P_FLASH3    = "FLASH 3/3"
