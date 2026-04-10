@@ -694,7 +694,7 @@ class CountFactoryStation(QMainWindow):
         self._show_manual_reboot_dialog()
 
     def _show_manual_reboot_dialog(self):
-        """Show dialog asking user to reboot devices to ADB, with live ADB count."""
+        """Show dialog asking user to reboot devices to ADB, with live ADB count. Auto-proceeds when all detected."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Reboot to ADB")
         dlg.setModal(True)
@@ -735,6 +735,13 @@ class CountFactoryStation(QMainWindow):
         def update_adb_count():
             tids = _adb_transport_ids()
             adb_count_label.setText(f"ADB devices: {len(tids)}/{self._device_count}")
+            
+            # Auto-proceed when all devices in ADB
+            if len(tids) >= self._device_count:
+                count_timer.stop()
+                self._log(f"All {self._device_count} device(s) detected in ADB — rebooting to EDL")
+                dlg.accept()
+                self._enter_manual_reboot_wait()
 
         # Initial update
         update_adb_count()
@@ -748,14 +755,7 @@ class CountFactoryStation(QMainWindow):
         btn.setStyleSheet(Styles.get_action_button_style(Colors.SUCCESS))
         btn.setFixedHeight(38)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        def on_continue():
-            count_timer.stop()
-            dlg.accept()
-            self._log("User confirmed devices are rebooting to ADB — waiting for ADB")
-            self._enter_manual_reboot_wait()
-
-        btn.clicked.connect(on_continue)
+        btn.setEnabled(False)  # Disabled since auto-proceed handles it
 
         layout.addWidget(icon)
         layout.addWidget(title)
@@ -775,33 +775,13 @@ class CountFactoryStation(QMainWindow):
         dlg.exec()
 
     def _enter_manual_reboot_wait(self):
-        """Wait for devices to appear in ADB after manual reboot, then auto-reboot to EDL."""
-        self._set_phase(P_QDL_DRAIN)
-        self._set_progress(0, spin=True)
-        self._set_eta("")
-        self._set_detail(f"0 / {self._device_count} in ADB")
-
-        self._poll_timer = QTimer()
-        self._poll_timer.timeout.connect(self._check_adb_for_reboot)
-        self._poll_timer.start(SCAN_INTERVAL_MS)
-
-        self._timeout_timer = QTimer()
-        self._timeout_timer.setSingleShot(True)
-        self._timeout_timer.timeout.connect(self._boot_timeout)
-        self._timeout_timer.start(self.boot_timeout_ms)
-
-    def _check_adb_for_reboot(self):
-        """Poll for ADB devices after manual reboot, then auto-reboot to EDL."""
+        """Get current ADB devices and reboot them to EDL for stage 3."""
         tids = _adb_transport_ids()
-        self._set_detail(f"{len(tids)} / {self._device_count} in ADB")
-        if len(tids) < self._device_count:
-            return
-
-        # Enough devices in ADB — stop poll timer and reboot to EDL
-        self._poll_timer.stop()
-        self._log(f"All {self._device_count} device(s) returned to ADB — rebooting to EDL")
-        self._stop_phase_timers()
-        self._enter_rebooting(tids[: self._device_count])
+        if tids and len(tids) >= self._device_count:
+            self._log(f"Rebooting {len(tids)} device(s) to EDL for stage 3")
+            self._enter_rebooting(tids[: self._device_count])
+        else:
+            self._set_failed(f"Expected {self._device_count} devices in ADB, found {len(tids)}")
 
     # ── Boot detection ────────────────────────────────────────────────────────
 
