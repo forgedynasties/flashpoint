@@ -32,17 +32,6 @@ class FlashManager:
             return None, None, None
     
     @staticmethod
-    def validate_firmware_folder(path):
-        """Check if directory contains valid firmware files."""
-        try:
-            files = os.listdir(path)
-            has_elf = any(f.endswith(".elf") for f in files)
-            has_raw = any("rawprogram" in f for f in files)
-            return has_elf and has_raw
-        except:
-            return False
-    
-    @staticmethod
     def build_flash_command(serial, prog, raw, patch, progress_socket=None, allow_fusing=False):
         """Build the QDL flash command.
 
