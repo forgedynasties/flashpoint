@@ -483,7 +483,14 @@ class CountFactoryStation(QMainWindow):
         }
 
         for idx, serial in enumerate(serials):
-            self._launch_one(serial, stage, idx, n, prog, raw, patch, wdir)
+            if idx == 0:
+                self._launch_one(serial, stage, idx, n, prog, raw, patch, wdir)
+            else:
+                QTimer.singleShot(
+                    idx * 3000,
+                    lambda s=serial, st=stage, i=idx, t=n, p=prog, r=raw, pa=patch, w=wdir:
+                        self._launch_one(s, st, i, t, p, r, pa, w),
+                )
 
     def _launch_one(self, serial, stage, idx, total, prog, raw, patch, wdir):
         proc = QProcess()
